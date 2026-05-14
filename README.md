@@ -1,6 +1,6 @@
 # dns-tunnel
 
-把任意 TCP 流量封进 DNS 查询 / 应答的隧道。典型场景:**只能解析 DNS 的网络环境**里跑 SSH、SCP、HTTP 代理等。协议借鉴 [iodine](./iodine/),Go 重写,只依赖 [`miekg/dns`](https://github.com/miekg/dns)。
+把任意 TCP 流量封进 DNS 查询 / 应答的隧道。典型场景:**只能解析 DNS 的网络环境**里跑 SSH、SCP、HTTP 代理等,只依赖 [`miekg/dns`](https://github.com/miekg/dns)。
 
 ---
 
