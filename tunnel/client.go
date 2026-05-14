@@ -45,6 +45,11 @@ type DNSClient struct {
 	lastUpSched uint8 // round-robin cursor for selectUpstream
 	tunnelUp    bool
 	upNotify    chan struct{}
+
+	quit     chan struct{}
+	listener net.Listener
+	running  bool
+	runMu    sync.RWMutex
 }
 
 func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain string) (*DNSClient, error) {
@@ -74,11 +79,43 @@ func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain s
 	return c, nil
 }
 
+func (c *DNSClient) Close() {
+	c.runMu.Lock()
+	c.running = false
+	c.runMu.Unlock()
+	c.tunnelUp = false
+	select {
+	case <-c.quit:
+	default:
+		close(c.quit)
+	}
+	if c.listener != nil {
+		c.listener.Close()
+	}
+}
+
+func (c *DNSClient) IsRunning() bool {
+	c.runMu.RLock()
+	defer c.runMu.RUnlock()
+	return c.running
+}
+
 func (c *DNSClient) Start() error {
+	c.quit = make(chan struct{})
+	c.runMu.Lock()
+	c.running = true
+	c.runMu.Unlock()
+	defer func() {
+		c.runMu.Lock()
+		c.running = false
+		c.runMu.Unlock()
+	}()
+
 	listener, err := net.Listen("tcp", c.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen failed: %v", err)
 	}
+	c.listener = listener
 	defer listener.Close()
 
 	if c.debug {
@@ -92,8 +129,18 @@ func (c *DNSClient) Start() error {
 	go c.dataLoop()
 
 	for {
+		select {
+		case <-c.quit:
+			return nil
+		default:
+		}
 		conn, err := listener.Accept()
 		if err != nil {
+			select {
+			case <-c.quit:
+				return nil
+			default:
+			}
 			if c.debug {
 				log.Printf("Accept error: %v", err)
 			}

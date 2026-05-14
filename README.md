@@ -93,3 +93,102 @@ sudo ./dns-tunnel -server-listen 0.0.0.0:53 -server-dest 127.0.0.1:22 -domain t.
 | `-debug` | 打印协议级日志 |
 
 `-server-*` 与 `-client-*` 二选一,各自的两个参数必须成对出现。
+
+---
+
+## 作为库使用
+
+`tunnel` 包导出了完整的 API,可以直接嵌入到你自己的 Go 程序中,无需通过命令行启动。
+
+### 导出 API
+
+| 类型/函数 | 说明 |
+|---|---|
+| `tunnel.NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain string)` | 创建客户端实例,`domain` 为空则直连模式 |
+| `tunnel.NewDNSServer(dnsListen, tcpDest string, debug bool, key string, domain string)` | 创建服务端实例 |
+| `client.Start() error` | 启动客户端 (阻塞),开始监听 TCP 并通过 DNS 隧道转发 |
+| `client.Close()` | 优雅关闭客户端,断开所有连接 |
+| `client.IsRunning() bool` | 查询客户端是否正在运行 (线程安全) |
+| `server.Start() error` | 启动服务端 (阻塞),监听 DNS 请求并转发到目标 TCP |
+| `server.Close()` | 优雅关闭服务端 |
+| `tunnel.DefaultKey` | 内置的 Vigenere 混淆密钥,客户端和服务端必须一致 |
+
+### 嵌入客户端
+
+```go
+package main
+
+import (
+    "log"
+    "dns-tunnel/tunnel"
+)
+
+func main() {
+    client, err := tunnel.NewDNSClient(
+        "127.0.0.1:8080",      // 本地 TCP 监听
+        "8.8.8.8:53",          // DNS 服务器
+        false,                 // debug
+        tunnel.DefaultKey,     // 加密密钥
+        "t.example.com",       // domain, 空串则直连
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Start() 阻塞, 放到 goroutine 里
+    go func() {
+        if err := client.Start(); err != nil {
+            log.Printf("client stopped: %v", err)
+        }
+    }()
+
+    // 通过 IsRunning() 判断隧道是否就绪
+    // ...
+
+    // 需要关闭时调用 Close(), Start() 会返回
+    client.Close()
+}
+```
+
+### 嵌入服务端
+
+```go
+server := tunnel.NewDNSServer(
+    "0.0.0.0:53",          // DNS 监听
+    "127.0.0.1:22",        // 转发目标
+    false,                 // debug
+    tunnel.DefaultKey,     // 密钥, 须与客户端一致
+    "t.example.com",       // domain
+)
+
+go func() {
+    if err := server.Start(); err != nil {
+        log.Fatal(err)
+    }
+}()
+
+// 关闭
+server.Close()
+```
+
+### CGO 静态库
+
+也可以编译为 C 静态库, 供 C/C++ 程序调用:
+
+```go
+// main.go (package main, import "C")
+//export StartDnsClient
+func StartDnsClient(listenAddr *C.char, dnsServer *C.char, debug C.int, key *C.char, domain *C.char) C.int {
+    client, err := tunnel.NewDNSClient(C.GoString(listenAddr), C.GoString(dnsServer), debug != 0, C.GoString(key), C.GoString(domain))
+    if err != nil { return -1 }
+    go client.Start()
+    return 0
+}
+```
+
+```bash
+CGO_ENABLED=1 go build -buildmode=c-archive -o libdnstunnel.a .
+# 生成 libdnstunnel.a + libdnstunnel.h
+```
+
+完整示例见 `example/` 目录。

@@ -271,6 +271,7 @@ type DNSServer struct {
 	domain           string
 	parentDomain     string
 	domainPartsCount int
+	dnsServerInst    *dns.Server
 }
 
 func NewDNSServer(dnsListener, tcpDest string, debug bool, key string, domain string) *DNSServer {
@@ -295,10 +296,17 @@ func NewDNSServer(dnsListener, tcpDest string, debug bool, key string, domain st
 	}
 }
 
+func (s *DNSServer) Close() {
+	if s.dnsServerInst != nil {
+		s.dnsServerInst.Shutdown()
+	}
+}
+
 func (s *DNSServer) Start() error {
 	go s.cleanupSessions()
 	dns.HandleFunc(".", s.handleDNSRequest)
 	server := &dns.Server{Addr: s.dnsListener, Net: "udp"}
+	s.dnsServerInst = server
 	if s.debug {
 		log.Printf("DNS server on %s (UDP)", s.dnsListener)
 	}
