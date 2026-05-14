@@ -1,4 +1,4 @@
-// embed-client demonstrates using dns-tunnel/tunnel as a library
+// embed-client demonstrates using github.com/queasy-ma/dns-tunnel/tunnel as a library
 // to embed a DNS tunnel client into your own application.
 //
 // Build:  go build -o embed-client .
@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"dns-tunnel/tunnel"
+	"github.com/queasy-ma/dns-tunnel/tunnel"
 )
 
 func main() {

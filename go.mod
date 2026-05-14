@@ -1,4 +1,4 @@
-module dns-tunnel
+module github.com/queasy-ma/dns-tunnel
 
 go 1.24.0
 

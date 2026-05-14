@@ -120,7 +120,7 @@ package main
 
 import (
     "log"
-    "dns-tunnel/tunnel"
+    "github.com/queasy-ma/dns-tunnel/tunnel"
 )
 
 func main() {

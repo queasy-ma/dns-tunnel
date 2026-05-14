@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	"dns-tunnel/tunnel"
+	"github.com/queasy-ma/dns-tunnel/tunnel"
 )
 
 func init() {
