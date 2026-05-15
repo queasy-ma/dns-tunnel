@@ -75,8 +75,15 @@ func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain s
 		streams:     make(map[uint8]*clientStream),
 		nextSID:     1,
 		upNotify:    make(chan struct{}, 1),
+		quit:        make(chan struct{}),
 	}
 	return c, nil
+}
+
+func (c *DNSClient) MarkRunning() {
+	c.runMu.Lock()
+	c.running = true
+	c.runMu.Unlock()
 }
 
 func (c *DNSClient) Close() {
