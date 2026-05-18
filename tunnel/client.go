@@ -541,6 +541,19 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 				continue
 			}
 			if msg.Rcode != dns.RcodeSuccess {
+				// FormErr / ServFail / Refused mean the server no longer
+				// recognises this session (restarted, or encoding mismatch
+				// after re-handshake). Tear the tunnel down so dataLoop
+				// exits and the caller can reconnect with a fresh session.
+				if msg.Rcode == dns.RcodeFormatError ||
+					msg.Rcode == dns.RcodeServerFailure ||
+					msg.Rcode == dns.RcodeRefused {
+					if c.debug {
+						log.Printf("DNS recv loop: fatal rcode %d, tearing down", msg.Rcode)
+					}
+					c.tunnelUp = false
+					return
+				}
 				continue
 			}
 			raw, err := c.extractAnswer(msg)
