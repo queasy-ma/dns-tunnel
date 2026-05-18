@@ -1,3 +1,20 @@
+// 本文件定义本隧道的"线协议"——上行查询元数据、下行包格式、分片重组、压缩。
+//
+// 协议总览（详见 DESIGN.md §2、§3）：
+//
+//	上行查询 QNAME：
+//	  <CMC>.<DATA|cmd>.<META=seq/frag/ack>.<SESSION>.<TLD>
+//	  - CMC：每查询随机,反递归缓存。
+//	  - META：3 字节 hex（6 字符）,seq==0xFF 表示控制帧。
+//
+//	下行 DNS 应答 RDATA（TXT 字符串或 NULL data）：
+//	  vigenere(DownPkt.Encode())  // 一帧一段,无 fragment
+//	  DownPkt: [Flags|Seq|Frag/L|Ack|SID|Payload...]
+//
+// 关键不变量：
+//   - 上下行 seq 各 1 字节,0..254 滚动,255 保留给控制帧标识。
+//   - 上下行各自 stop-and-wait,最多 1 个未确认 chunk 在途。
+//   - Frag 字段保留,本实现一帧一段、LastFrag 恒为 true。
 package tunnel
 
 import (
@@ -9,39 +26,53 @@ import (
 )
 
 const (
+	// protoVersion 是 cmdVersion 握手时双方互验的协议版本号。
+	// 任何线格式变更（meta 长度、DownPkt 头、新命令）都应递增这个值。
 	protoVersion = 1
 
+	// seqControl 是上行 meta 第 1 字节 == 0xFF 的"控制帧"标记。
+	// 客户端发任何控制命令时 seq 都填这个,数据帧 seq 走 0..254。
 	seqControl = uint8(0xFF)
 
-	cmdPoll        = uint8(0x00)
-	cmdVersion     = uint8(0x01)
-	cmdFragSize    = uint8(0x02)
-	cmdLazy        = uint8(0x03)
-	cmdCompress    = uint8(0x04)
-	cmdRecType     = uint8(0x05)
-	cmdClose       = uint8(0x06)
-	cmdOpenStream  = uint8(0x07)
-	cmdCloseStream = uint8(0x08)
+	// 控制命令字（meta 第 2 字节）。新增命令必须同步加 client 发送函数 +
+	// server handleControl 的 case。
+	cmdPoll        = uint8(0x00) // 空查询,捎带 ack,等下行
+	cmdVersion     = uint8(0x01) // 版本协商（握手第 1 步）
+	cmdFragSize    = uint8(0x02) // 下行 fragsize 探测 / commit（参数区分）
+	cmdLazy        = uint8(0x03) // 启 / 关 lazy hold
+	cmdCompress    = uint8(0x04) // 启 / 关 zlib 压缩
+	cmdRecType     = uint8(0x05) // NULL 记录探测 / Base64 编码探测
+	cmdClose       = uint8(0x06) // 关整个 session
+	cmdOpenStream  = uint8(0x07) // 新建 stream（参数 = streamID）
+	cmdCloseStream = uint8(0x08) // 关 stream
 
-	flagLastFrag     = uint8(0x80)
-	flagCompressed   = uint8(0x40)
-	flagClosed       = uint8(0x20)
-	flagStreamClosed = uint8(0x10)
+	// DownPkt Flags 字段的位定义。
+	flagLastFrag     = uint8(0x80) // 本片是最后一片（本实现恒为 1）
+	flagCompressed   = uint8(0x40) // payload 走 zlib 压缩,接收端要 ZlibDecompress
+	flagClosed       = uint8(0x20) // 整个 session 关闭,client 应析构隧道
+	flagStreamClosed = uint8(0x10) // 某个 stream 关闭（SID 字段指明）
 
-	maxSeqNo          = 254
-	downPktHeaderSize = 5
+	maxSeqNo          = 254 // 序号最大值；255 留给 seqControl
+	downPktHeaderSize = 5   // DownPkt 头部固定 5 字节
 )
 
+// UpMeta 是上行 QNAME 的 META 段（6 hex = 3 字节）解出来的结构。
+//
+// 字段语义按 IsControl 分两种：
+//   - 数据帧（Seq != 0xFF）：Seq / Frag / LastFrag / Ack 字段有效。
+//   - 控制帧（Seq == 0xFF）：Command / Param / Ack 字段有效；其它无视。
 type UpMeta struct {
-	Seq       uint8
-	Frag      uint8
-	LastFrag  bool
-	Ack       uint8
-	IsControl bool
-	Command   uint8
-	Param     uint8
+	Seq       uint8 // 上行序号；==0xFF 表示控制帧
+	Frag      uint8 // 上行分片号（保留,目前总 0）
+	LastFrag  bool  // 是最后一片（保留,目前总 true）
+	Ack       uint8 // 对最近一个**下行** seq 的确认（捎带）
+	IsControl bool  // Seq == seqControl 时为 true
+	Command   uint8 // 控制帧的命令字（cmd* 常量）
+	Param     uint8 // 控制帧的参数；poll 用作 downAck,openStream 用作 streamID
 }
 
+// ParseMeta 把 6 字符 hex META 解成 UpMeta。
+// 调用方必须保证 s 是已经从 QNAME 中切出来的 6 字符段。
 func ParseMeta(s string) (UpMeta, error) {
 	if len(s) != 6 {
 		return UpMeta{}, fmt.Errorf("bad meta len %d", len(s))
@@ -60,16 +91,19 @@ func ParseMeta(s string) (UpMeta, error) {
 	}
 	m := UpMeta{Seq: ss, Ack: aa}
 	if ss == seqControl {
+		// 控制帧布局：[0xFF][Command][Param]
 		m.IsControl = true
 		m.Command = ff
 		m.Param = aa
 	} else {
+		// 数据帧布局：[Seq][LastFrag(1)|Frag(7)][Ack]
 		m.LastFrag = (ff & 0x80) != 0
 		m.Frag = ff & 0x7F
 	}
 	return m, nil
 }
 
+// DataMeta 给数据帧拼 6 字符 hex META。frag 截到 7 bit；LastFrag 占最高位。
 func DataMeta(seq, frag, ack uint8, last bool) string {
 	ff := frag & 0x7F
 	if last {
@@ -78,22 +112,32 @@ func DataMeta(seq, frag, ack uint8, last bool) string {
 	return fmt.Sprintf("%02x%02x%02x", seq, ff, ack)
 }
 
+// CtrlMeta 给控制帧拼 6 字符 hex META。固定首字节 0xff。
 func CtrlMeta(cmd, param uint8) string {
 	return fmt.Sprintf("ff%02x%02x", cmd, param)
 }
 
+// DownPkt 是下行包的逻辑视图。线上格式见 Encode / DecodeDownPkt。
+//
+// 一次完整的下行 DNS 应答 = vigenere(DownPkt.Encode())；TXT 还要再过一道 DNS-safe 编码。
 type DownPkt struct {
-	Seq          uint8
-	Frag         uint8
-	LastFrag     bool
-	Ack          uint8
-	StreamID     uint8
-	Compressed   bool
-	Closed       bool
-	StreamClosed bool
-	Payload      []byte
+	Seq          uint8  // 下行序号
+	Frag         uint8  // 分片号（保留,目前总 0）
+	LastFrag     bool   // 是最后一片（目前总 true）
+	Ack          uint8  // 对上行最近 Seq 的确认
+	StreamID     uint8  // payload 所属 stream；0 表示非 stream 数据（控制响应）
+	Compressed   bool   // payload 被 zlib 压缩
+	Closed       bool   // 整 session 关闭
+	StreamClosed bool   // 该 stream 关闭（其它 stream 不受影响）
+	Payload      []byte // 真正的字节内容（可能空）
 }
 
+// Encode 把 DownPkt 序列化为 5+N 字节：
+//
+//	[Flags|Seq|Frag/Last|Ack|SID|Payload...]
+//
+// Frag 与 LastFrag 既出现在 Flags 的最高位,又重复出现在 Frag/Last 字节最高位——
+// 这是历史遗留（向后兼容客户端的两种解析方式）。Decode 端两处会都看,任一为 1 即视为最后片。
 func (p *DownPkt) Encode() []byte {
 	flags := uint8(0)
 	if p.LastFrag {
@@ -122,6 +166,11 @@ func (p *DownPkt) Encode() []byte {
 	return out
 }
 
+// DecodeDownPkt 是 Encode 的逆操作。
+//
+// **稳定性要点**：至少要 5 字节才能解出头部；少于 5 字节直接报错。这是历史上
+// "dummy 'x'" 死锁能复现的关键——单字节 payload 不会被当作合法 DownPkt 接受,
+// 而是 silently 丢掉。现在服务端已经不再回 dummy "x",但保留这个长度检查作为防线。
 func DecodeDownPkt(data []byte) (*DownPkt, error) {
 	if len(data) < 5 {
 		return nil, fmt.Errorf("pkt too short: %d", len(data))
@@ -142,16 +191,21 @@ func DecodeDownPkt(data []byte) (*DownPkt, error) {
 	return p, nil
 }
 
+// FragBuf 是上行重组缓冲（按分片号收齐后拼成完整帧）。
+//
+// **目前未使用**——本实现一帧一段,Frag 字段恒为 0、LastFrag 恒为 true。
+// 保留这个结构是为了将来支持"多片上行 / 下行"协议扩展时无需重建。
 type FragBuf struct {
 	mu    sync.Mutex
 	frags map[uint8][]byte
-	last  int
+	last  int // 已知的最后一片下标；-1 表示尚未收到 LastFrag
 }
 
 func NewFragBuf() *FragBuf {
 	return &FragBuf{frags: make(map[uint8][]byte), last: -1}
 }
 
+// Add 把一片塞进去。重复 idx 会覆盖（容忍重传）。
 func (fb *FragBuf) Add(idx uint8, isLast bool, data []byte) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
@@ -163,6 +217,7 @@ func (fb *FragBuf) Add(idx uint8, isLast bool, data []byte) {
 	}
 }
 
+// Complete 检查 [0..last] 区间是否每个 idx 都收到了。
 func (fb *FragBuf) Complete() bool {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
@@ -177,6 +232,7 @@ func (fb *FragBuf) Complete() bool {
 	return true
 }
 
+// Assemble 把所有片按 idx 顺序拼起来。调用前应先 Complete()==true。
 func (fb *FragBuf) Assemble() []byte {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
@@ -187,6 +243,7 @@ func (fb *FragBuf) Assemble() []byte {
 	return out
 }
 
+// Reset 清空缓冲,准备下一帧。
 func (fb *FragBuf) Reset() {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
@@ -194,6 +251,9 @@ func (fb *FragBuf) Reset() {
 	fb.last = -1
 }
 
+// ZlibCompress 用最高压缩等级压缩 data。
+// 仅当压缩后比原始小才返回 (compressed, true)；否则返回原 data + false。
+// 这避免了对短串 / 已压缩内容做"反向膨胀"。调用方按 ok 决定是否设置 flagCompressed。
 func ZlibCompress(data []byte) ([]byte, bool) {
 	var buf bytes.Buffer
 	w, err := zlib.NewWriterLevel(&buf, zlib.BestCompression)
@@ -208,6 +268,7 @@ func ZlibCompress(data []byte) ([]byte, bool) {
 	return data, false
 }
 
+// ZlibDecompress 是 ZlibCompress 的逆操作。Decode 端只在 flagCompressed=1 时调用。
 func ZlibDecompress(data []byte) ([]byte, error) {
 	r, err := zlib.NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -217,6 +278,8 @@ func ZlibDecompress(data []byte) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
+// hexByte 把 2 字符 hex 字符串解成 1 字节,接受大小写混合。
+// 自己实现而不用 strconv 是因为 strconv 对前导 '0' / 大小写更挑。
 func hexByte(s string) (uint8, error) {
 	if len(s) != 2 {
 		return 0, fmt.Errorf("need 2 hex chars")
@@ -238,6 +301,9 @@ func hexByte(s string) (uint8, error) {
 	return v, nil
 }
 
+// nextSeq 在 [0..254] 上滚动 +1。
+// 注意：返回 255 是非法的（255 == seqControl）——所以滚动到 maxSeqNo+1 时回 0,
+// 而不是从 0 重新开始数。
 func nextSeq(s uint8) uint8 {
 	s++
 	if s > maxSeqNo {

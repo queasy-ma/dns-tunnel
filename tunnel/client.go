@@ -1,3 +1,23 @@
+// 本文件实现 dns-tunnel 的客户端侧。
+//
+// 角色：监听本地 TCP,把每个连接映射成一条 stream,数据编进 DNS 查询 QNAME 发给服务端；
+// DNS 应答解码后写回本地 TCP socket。
+//
+// 关键组件：
+//   - DNSClient        ：客户端运行态,管理监听 socket + sessionID + stream 表。
+//   - dataLoop         ：唯一负责"发上行 + 收下行"的 goroutine,严格 1-in-flight。
+//   - dnsRecvLoop      ：唯一负责底层 socket 读的 goroutine,解出 DNS 响应送入 recvCh。
+//   - streamReader     ：每个 stream 一个,本地 TCP read → 入 upBuf,唤醒 dataLoop。
+//   - streamWriter     ：每个 stream 一个,从 downBuf 异步写本地 TCP,不阻塞 dataLoop。
+//   - 握手 sendDNS*    ：用独立的 c.dnsClient（同步 Exchange）完成版本协商、编码探测等。
+//
+// 设计取舍 / 关键不变量（详见 DESIGN.md §6.1）：
+//   - **严格 1-in-flight**：在 dataLoop 里用 `inFlight` 标记保证最多 1 个查询在途。
+//     违反它会让 server 端 lazyHeld 兜底节流路径反复触发,QPS 飙到 ~10/s。
+//   - **空闲发包节拍由 server 控制**：客户端"收响应立刻发下一个",自己不加 idle gap；
+//     server 端 lazy hold (~1s) 决定空闲 QPS。
+//   - **dataLoop 不阻塞本地 TCP I/O**：上行写入 upBuf、下行写入 downBuf,真正的 TCP 读 / 写
+//     在 streamReader / streamWriter 里跑。任何一个 stream 卡住都不会拖死整个隧道。
 package tunnel
 
 import (
@@ -13,45 +33,71 @@ import (
 	"github.com/miekg/dns"
 )
 
+// clientStream —— 客户端侧一条 stream 的运行态。
+//
+// 字段语义：
+//   - id      ：1..254 的 streamID,与服务端 Stream.id 对齐；0 是哨兵值,不用。
+//   - conn    ：本地 TCP socket（应用如 ssh client 连上来的那个）。
+//   - upBuf   ：本地 TCP 读出的字节,等 selectUpstream 取去打包成 DNS 查询。
+//   - downBuf ：DNS 响应 payload 解出的字节,等 streamWriter 写回本地 TCP。
+//   - downSig ：streamWriter 阻塞等数据的唤醒信号；非阻塞写,容量 1。
+//   - closed  ：硬关闭。一旦置 true,reader / writer 看到就立刻退出,不再写本地 TCP。
+//   - closing ：软关闭。服务端 EOF 时设置；writer 先把 downBuf 残留写完再关 conn,
+//     防止 SCP 等场景丢尾字节（见 §14 修复演进 #4）。
 type clientStream struct {
 	id      uint8
 	conn    net.Conn
-	upBuf   *DataBuf // local TCP → tunnel
-	downBuf *DataBuf // tunnel → local TCP
+	upBuf   *DataBuf // 本地 TCP → 隧道上行
+	downBuf *DataBuf // 隧道下行 → 本地 TCP
 	downSig chan struct{}
-	closed  bool // hard closed; reader/writer exit immediately
-	closing bool // soft close requested (server-side EOF); writer drains then closes
+	closed  bool // 硬关闭：reader / writer 立刻退出
+	closing bool // 软关闭：writer 排完队再关 socket
 }
 
+// DNSClient —— 客户端总状态。
+//
+// 锁规约：
+//   - mu     ：保护 streams / nextSID / lastUpSched / 各 stream 的 closed / closing 字段。
+//   - runMu  ：保护 running 标志,允许外部并发查询 IsRunning。
+//   - 字段如 maxFrag / encoding / lazyMode 等握手协商出来的"会话级配置",
+//     只在握手期写一次、之后只读,**不**需要锁；dataLoop 直接读。
 type DNSClient struct {
-	listenAddr string
-	dnsServer  string
-	sessionID  string
-	tld        string
-	dnsClient  *dns.Client
+	listenAddr string      // 本地 TCP 监听地址（"127.0.0.1:2222" 之类）
+	dnsServer  string      // 上游 DNS 服务器地址（直连模式 = 本服务端；委派模式 = 企业内 DNS）
+	sessionID  string      // 7 字符 Base32 sessionID,每次 setupTunnel 重新生成
+	tld        string      // FQDN 尾巴：直连用 "edu",委派模式用 -domain
+	dnsClient  *dns.Client // 同步 Exchange 用的客户端（握手 / 控制命令走这条）
 	debug      bool
-	key        string
+	key        string // Vigenère key
 
+	// 握手协商出的会话级配置。握手完成后只读,无需锁。
 	lazyMode    bool
 	compression bool
 	useNULL     bool
-	maxFrag     int
-	encoding    int
-	upPayload   int
+	maxFrag     int // 下行单包 payload 上限（影响服务端切片）
+	encoding    int // EncBase32 / EncBase64,影响 upPayload
+	upPayload   int // 上行单包能塞的明文字节上限
 
+	// 受 mu 保护：
 	mu          sync.Mutex
 	streams     map[uint8]*clientStream
-	nextSID     uint8
-	lastUpSched uint8 // round-robin cursor for selectUpstream
-	tunnelUp    bool
+	nextSID     uint8 // 下一次 allocStreamIDLocked 的起点
+	lastUpSched uint8 // selectUpstream 的 round-robin 游标
+	tunnelUp    bool  // 隧道存活；dnsRecvLoop 致命错误时会置 false
 	upNotify    chan struct{}
 
+	// 进程级生命周期管理：
 	quit     chan struct{}
 	listener net.Listener
 	running  bool
 	runMu    sync.RWMutex
 }
 
+// NewDNSClient 构造但不启动客户端。listenAddr 是本地 TCP 监听地址,
+// dnsServer 是上游 DNS 服务器（含端口）；debug 打开协议级日志。
+//
+// 初始默认：lazy + compression 开启、Base32 编码、TXT 记录。这些值在握手时
+// 可能被协商关 / 升级,但默认开启避免"还没握手成功 dataLoop 就先按错配置发包"。
 func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain string) (*DNSClient, error) {
 	suffix := defaultTLD
 	if domain != "" {
@@ -80,12 +126,16 @@ func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain s
 	return c, nil
 }
 
+// MarkRunning 由外部嵌入式使用者调用,把 running 标记成 true。
+// 普通命令行模式下 Start 内部会自己设,无需手动调用。
 func (c *DNSClient) MarkRunning() {
 	c.runMu.Lock()
 	c.running = true
 	c.runMu.Unlock()
 }
 
+// Close 优雅关闭客户端：tunnel down + close quit + close listener。
+// 已经 close 过的 quit 不重复 close（用 select+default 探测）。
 func (c *DNSClient) Close() {
 	c.runMu.Lock()
 	c.running = false
@@ -101,12 +151,18 @@ func (c *DNSClient) Close() {
 	}
 }
 
+// IsRunning 用 RLock 允许并发查询;runMu 写者只在 MarkRunning / Close / Start 启停时短暂持有。
 func (c *DNSClient) IsRunning() bool {
 	c.runMu.RLock()
 	defer c.runMu.RUnlock()
 	return c.running
 }
 
+// Start 是阻塞主循环：监听 TCP、setupTunnel 握手、启动 dataLoop,
+// 然后在 Accept 循环里把每个 TCP 连接挂成新 stream。
+//
+// 错误恢复：dataLoop 发现 tunnelUp=false 后退出；下一个 Accept 时会触发
+// setupTunnel 重新握手 + 重启 dataLoop（"惰性重连"）。
 func (c *DNSClient) Start() error {
 	c.quit = make(chan struct{})
 	c.runMu.Lock()
@@ -136,6 +192,7 @@ func (c *DNSClient) Start() error {
 	go c.dataLoop()
 
 	for {
+		// 每次 Accept 前先检查 quit,防止 listener.Close 后还在傻 Accept。
 		select {
 		case <-c.quit:
 			return nil
@@ -143,6 +200,7 @@ func (c *DNSClient) Start() error {
 		}
 		conn, err := listener.Accept()
 		if err != nil {
+			// Close() 走的就是 listener.Close()→Accept 返回 err 的路径。
 			select {
 			case <-c.quit:
 				return nil
@@ -154,6 +212,7 @@ func (c *DNSClient) Start() error {
 			continue
 		}
 
+		// 上一次 dataLoop 退出（tunnel 死）后,这里惰性重建。
 		if !c.tunnelUp {
 			if c.debug {
 				log.Printf("Tunnel down, re-establishing...")
@@ -168,6 +227,8 @@ func (c *DNSClient) Start() error {
 			go c.dataLoop()
 		}
 
+		// 分配 streamID：必须用 allocStreamIDLocked 扫描空闲 slot,
+		// 不能裸 nextSID++（254 回绕后会复用未关的 ID,数据串错流）。
 		c.mu.Lock()
 		sid, ok := c.allocStreamIDLocked()
 		if !ok {
@@ -193,6 +254,8 @@ func (c *DNSClient) Start() error {
 			log.Printf("New TCP connection → stream %d", sid)
 		}
 
+		// cmdOpenStream 走同步 sendDNS（带 10 次重试）,服务端 dial 远端 TCP
+		// 可能耗时（最长 dialer.Timeout=10s）。失败立即 close 本地 conn。
 		if err := c.cmdOpenStream(sid); err != nil {
 			if c.debug {
 				log.Printf("Stream %d open failed: %v", sid, err)
@@ -209,8 +272,16 @@ func (c *DNSClient) Start() error {
 	}
 }
 
-// streamWriter drains downBuf into the local TCP socket asynchronously,
-// so the dataLoop never blocks on a slow consumer.
+// streamWriter —— 把 downBuf 的字节异步写进本地 TCP socket。
+//
+// 为什么独立 goroutine？dataLoop 的 processDown 只把 payload Write 进 downBuf
+// 就立刻返回；真正的 syscall.Write 由这里来做。任何一条 stream 的本地 TCP
+// 写慢（消费者堵塞、kernel buffer 满）都不会卡 dataLoop,其它 stream 照常工作。
+//
+// 关闭语义：
+//   - closed=true：硬关,立刻 return,不再写。
+//   - closing=true 且 downBuf 空：服务端已发 StreamClosed,把残留写完后关 socket。
+//   - downBuf 空且没 closing：阻塞等 downSig 或 2s 超时（轮询用,防止真的死锁）。
 func (c *DNSClient) streamWriter(stream *clientStream) {
 	for {
 		data := stream.downBuf.Take(64 * 1024)
@@ -227,6 +298,7 @@ func (c *DNSClient) streamWriter(stream *clientStream) {
 				delete(c.streams, stream.id)
 				c.mu.Unlock()
 				stream.conn.Close()
+				// 通知服务端别再发数据。后台异步发,不阻塞本 goroutine 退出。
 				go c.cmdCloseStream(stream.id)
 				return
 			}
@@ -240,7 +312,7 @@ func (c *DNSClient) streamWriter(stream *clientStream) {
 			return
 		}
 		if closing {
-			// Buffer drained and server signaled EOF — finalize.
+			// 缓冲已经空了,且服务端已经发过 EOF,可以真正关 socket。
 			c.mu.Lock()
 			stream.closed = true
 			c.mu.Unlock()
@@ -254,8 +326,12 @@ func (c *DNSClient) streamWriter(stream *clientStream) {
 	}
 }
 
-// allocStreamIDLocked scans for a free stream ID, starting at c.nextSID.
-// Caller must hold c.mu. Returns (0, false) if all 254 slots are in use.
+// allocStreamIDLocked 在 c.streams 里扫一遍找空闲 streamID。
+//
+// **必须**持有 c.mu。返回 (0, false) 表示 254 个槽位全占用,拒绝新连接。
+//
+// 历史 bug（DESIGN.md §14 #6）：早期实现就是 `sid = nextSID++`,uint8 滚到 254
+// 后回到 1,如果旧 stream 还没关就会复用 ID,新连接的数据被写到旧 conn 上。
 func (c *DNSClient) allocStreamIDLocked() (uint8, bool) {
 	for tries := 0; tries < maxStreams; tries++ {
 		sid := c.nextSID
@@ -270,6 +346,13 @@ func (c *DNSClient) allocStreamIDLocked() (uint8, bool) {
 	return 0, false
 }
 
+// setupTunnel 重置会话级状态 + 执行 5 步握手。
+//
+// 重置内容：sessionID（新生成）、encoding 回到 Base32、maxFrag 回到默认、
+// streams map 清空、nextSID 复位。重连场景下旧 stream 仍然指向旧 conn,
+// 但 dataLoop 已经退出,旧 stream 的 reader/writer 在 conn 关后自然退出。
+//
+// 注意：握手包走的是 c.dnsClient（同步 Exchange）,不经过 dataLoop。
 func (c *DNSClient) setupTunnel() error {
 	c.sessionID = generateSessionID()
 	c.useNULL = false
@@ -297,6 +380,10 @@ func (c *DNSClient) setupTunnel() error {
 	return nil
 }
 
+// streamReader —— 把本地 TCP read 来的字节塞进 upBuf,唤醒 dataLoop。
+//
+// 本 goroutine 阻塞在 conn.Read,有数据就 Write 入 upBuf,再非阻塞通知
+// dataLoop。Read 出错（包括 EOF）→ 标记 stream.closed + 通知服务端关流 + 退出。
 func (c *DNSClient) streamReader(stream *clientStream) {
 	buf := make([]byte, 4096)
 	for {
@@ -320,22 +407,24 @@ func (c *DNSClient) streamReader(stream *clientStream) {
 	}
 }
 
+// selectUpstream —— round-robin 选一个有数据可发的 stream,取出最多 upPayload-1 字节。
+//
+// 返回值：(streamID, payload)。没有任何 stream 有数据时返回 (0, nil)。
+//
+// **公平调度算法**（DESIGN.md §8.3）：从 lastUpSched+1 开始循环 maxStreams+1 次,
+// 让一个重负载 stream（大文件上传）不会霸占单一上行窗口、把其它 stream 的
+// keepalive 饿死。`maxStreams+1` 而不是 `maxStreams` 是为了让循环回到 start
+// 自己——少一次就漏掉 start。**0 是哨兵 streamID,直接 continue 跳过**。
 func (c *DNSClient) selectUpstream() (uint8, []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// 上行 payload 第 0 字节是 streamID,所以实际数据空间是 upPayload-1。
 	maxData := c.upPayload - 1
 	if maxData < 1 {
 		return 0, nil
 	}
 
-	// Round-robin: start from the slot AFTER the last one we served so a
-	// heavy stream cannot monopolize the single upstream window and starve
-	// keepalives/control on its peers. The loop runs maxStreams+1 times so
-	// that the last position visited wraps back to `start` itself — without
-	// this, a single-stream tunnel serves the stream exactly once and then
-	// starves it forever, because the loop ranges over the other 254 mod
-	// classes (and sid=0, which is skipped).
 	start := c.lastUpSched
 	for i := 1; i <= maxStreams+1; i++ {
 		sid := uint8((int(start) + i) % (maxStreams + 1))
@@ -355,6 +444,20 @@ func (c *DNSClient) selectUpstream() (uint8, []byte) {
 	return 0, nil
 }
 
+// dataLoop —— 唯一的"发上行 + 收下行"调度 goroutine。
+//
+// 规约：
+//   - 与 dnsRecvLoop 共用一个 UDP socket（net.Dial("udp", server) 后只用这一条）。
+//   - 严格 1-in-flight：每次发包后 inFlight=true,收到响应才 inFlight=false 并发下一个。
+//   - 收到响应就立刻发下一个（不加 idle gap,见 §14 修复演进 #5）。
+//   - tunnelUp=false 就退出；外层 Accept 循环会触发重连。
+//
+// 三路 select：
+//   - recvCh：收到 DNS 响应,处理 ack + payload,然后立刻 send 下一个。
+//   - upNotify：streamReader 通知有新上行字节,但**只在 !inFlight && upAcked 时才 send**,
+//     否则下一次 recvCh 触发时 selectUpstream 会自然拿到这些字节。
+//   - timeout：lazy 模式 2s、非 lazy 5s。inFlight=true 表示丢响应,重传同一帧；
+//     inFlight=false 表示真的空闲（异常路径,正常不会触发,因为有 lazy hold）。
 func (c *DNSClient) dataLoop() {
 	conn, err := net.Dial("udp", c.dnsServer)
 	if err != nil {
@@ -369,20 +472,22 @@ func (c *DNSClient) dataLoop() {
 	recvCh := make(chan []byte, 64)
 	go c.dnsRecvLoop(conn, recvCh)
 
-	var upSeq uint8
-	var downAck uint8
-	var lastUpData []byte
-	var lastUpSID uint8
-	upAcked := true
-	downInited := false
-	var lastDownSeq uint8
-	// inFlight enforces the stop-and-wait invariant: at most one query is
-	// outstanding to the server at any moment. Without this, upNotify or a
-	// stray timeout can fire a second query before the previous response
-	// arrives, which the server's lazyHeld mutex turns into a ~10/s storm
-	// (minLazyHold throttle on the concurrentPoll path).
+	var upSeq uint8       // 下一次上行帧的 seq
+	var downAck uint8     // 要捎带给服务端的"最近收到的下行 seq"
+	var lastUpData []byte // 重传缓冲：未 ack 的上行 payload
+	var lastUpSID uint8   // 上一次发的 streamID（重传用）
+	upAcked := true       // 上一帧已被服务端 ack
+	downInited := false   // 是否已经收到过下行,用于 lastDownSeq 初始化
+	var lastDownSeq uint8 // 上次收到的下行 seq,用于去重（同 seq 重传）
+	// inFlight：严格 1-in-flight 不变量的实现。
+	//   - 进 send() = inFlight=true；
+	//   - recv 到任意响应 = inFlight=false。
+	// 没有这个标志,upNotify / timeout 可能触发第二个并发查询,服务端
+	// 看到的就是"同 session 多个并发查询",lazyHeld 兜底会触发 ~10/s 风暴。
 	inFlight := false
 
+	// send —— 发一个查询。优先重传未 ack 的旧帧,否则从 selectUpstream 取新数据,
+	// 都没有的话发 poll。
 	send := func() {
 		if !upAcked && lastUpData != nil {
 			c.asyncSendStreamData(conn, lastUpSID, lastUpData, upSeq, downAck)
@@ -405,6 +510,8 @@ func (c *DNSClient) dataLoop() {
 	for c.tunnelUp {
 		timeout := 5 * time.Second
 		if c.lazyMode {
+			// lazy 模式下,服务端会 hold 最多 lazyTimeout(1s),所以客户端 2s 仍未
+			// 收到响应基本就是丢包/远端死了。
 			timeout = 2 * time.Second
 		}
 
@@ -421,33 +528,32 @@ func (c *DNSClient) dataLoop() {
 				}
 			}
 
+			// processDown 里如果收到 Closed 标志会把 tunnelUp 置 false。
 			if !c.tunnelUp {
 				return
 			}
 
-			// Keep exactly one query in flight: every received response
-			// triggers the next send. The server's lazy-hold (up to
-			// lazyTimeout) is what rate-limits us in idle — deferring on
-			// the client side adds visible latency to async server pushes
-			// (e.g. command output streaming back), so we don't.
+			// 严格 1-in-flight：每收到一个响应就立刻发下一个。空闲节拍由
+			// server 端 lazy hold(~1s) 决定,client 这里不加 gap——加了会
+			// 让服务端 async 推送（如命令输出）的首字节延迟暴涨。
 			send()
 
 		case <-c.upNotify:
-			// New upstream bytes arrived. We can only act on them if no
-			// query is in flight (1-in-flight invariant); otherwise the
-			// next recvCh tick will pick them up via selectUpstream.
+			// streamReader 通知有新上行字节。只在 !inFlight && upAcked 时发,
+			// 否则违反 1-in-flight；下一次 recvCh 触发 send() 时 selectUpstream
+			// 也会取到这些字节,数据不会丢。
 			if !inFlight && upAcked {
 				send()
 			}
 
 		case <-time.After(timeout):
-			// Either a lost response (retransmit) or a genuinely idle
-			// gap. Either way only one query at a time.
+			// 上一次发包后既没收到响应,也没有 upNotify 触发——要么响应丢了,
+			// 要么真的空闲（lazy 模式应该有 lazy hold 兜着,正常不会到这里）。
 			if !inFlight {
 				send()
 			} else {
-				// Suspected lost response: retransmit the same packet
-				// rather than firing a fresh second query.
+				// 怀疑响应丢失：重传同一帧而不是发新帧。
+				// 重传时不消耗新的 upSeq,服务端去重层会按 QNAME 命中缓存。
 				if !upAcked && lastUpData != nil {
 					c.asyncSendStreamData(conn, lastUpSID, lastUpData, upSeq, downAck)
 				} else {
@@ -458,6 +564,16 @@ func (c *DNSClient) dataLoop() {
 	}
 }
 
+// processDown —— 处理一个解码好的 DownPkt：更新 ack、把 payload 塞进对应 stream 的 downBuf。
+//
+// 状态机字段通过指针传入,避免 dataLoop 维护一份、processDown 又维护一份。
+//
+// 流程：
+//  1. Closed flag → tunnelUp=false,dataLoop 退出。
+//  2. StreamClosed → 标记 stream.closing,writer 排空 downBuf 后关 socket。
+//  3. payload + 新 seq → 入 downBuf + downSig 唤醒 writer + 更新 downAck/lastDownSeq。
+//
+// **去重**：pkt.Seq == lastDownSeq 表示同 seq 重传,跳过 payload 处理（避免重复写）。
 func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, lastDownSeq *uint8) {
 	if pkt.Closed {
 		c.tunnelUp = false
@@ -468,6 +584,8 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 		c.mu.Lock()
 		stream, ok := c.streams[pkt.StreamID]
 		if ok {
+			// closing-then-close（DESIGN.md §14 #4）：writer 排空 downBuf 再关 conn,
+			// 避免 SCP 大文件传输丢尾字节。
 			stream.closing = true
 			delete(c.streams, pkt.StreamID)
 		}
@@ -484,6 +602,7 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 	}
 
 	if len(pkt.Payload) > 0 && pkt.StreamID > 0 {
+		// 新 seq 才处理；同 seq 是 DNS 重传或 UDP 重复,跳过 payload。
 		if !*downInited || pkt.Seq != *lastDownSeq {
 			if !*downInited {
 				*downInited = true
@@ -492,8 +611,7 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 			stream, ok := c.streams[pkt.StreamID]
 			c.mu.Unlock()
 			if ok && !stream.closed {
-				// Hand the payload to the per-stream writer goroutine;
-				// never block dataLoop on the local TCP write.
+				// 把 payload 交给 per-stream writer goroutine,dataLoop 不阻塞在本地 TCP。
 				stream.downBuf.Write(pkt.Payload)
 				select {
 				case stream.downSig <- struct{}{}:
@@ -506,6 +624,21 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 	}
 }
 
+// dnsRecvLoop —— 唯一的底层 UDP socket 读 goroutine。
+//
+// 流程：阻塞 Read → 解 DNS msg → 抽 RDATA → 写 recvCh。
+//
+// **容错策略**：
+//   - 短暂 ICMP 错误（ECONNREFUSED / EHOSTUNREACH / ENETUNREACH）忽略：
+//     Linux 在对端 reply socket 短暂消失时会回这些,但下一次 Exchange 通常
+//     就恢复了。让 dataLoop 的 timeout 路径自己重传即可。
+//   - FormatError / ServerFailure / Refused：服务端不再认这个 session
+//     （可能重启了、或者编码协商失败）。直接 tunnelUp=false,Start 循环会重连。
+//   - 其它致命错误（i/o 永久错）：tunnelUp=false。
+//
+// **背压**：recvCh 容量 64,写入时给 100ms 超时；超时丢包并打日志。
+// 历史 bug（DESIGN.md §14 #8）：早期 `default` 直接丢,dataLoop 偶尔卡一下就静默丢响应,
+// 看似稳定但偶现死锁。
 func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 	buf := make([]byte, 65536)
 	for c.tunnelUp {
@@ -515,12 +648,9 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			// Tolerate transient ICMP-derived errors: connection refused,
-			// host/net unreachable. These can fire on Linux when the
-			// server's reply socket is briefly missing or kernel emits a
-			// stale unreachable, and we don't want a single ICMP bounce
-			// to tear the whole tunnel down — dataLoop's timeout will
-			// retransmit on its own.
+			// 容忍 ICMP 派生的瞬态错误：Linux 在 reply socket 暂时
+			// 不存在 / 内核发陈旧 unreachable 时会冒这些。隧道不应
+			// 因一个 ICMP 弹回就完全垮掉——dataLoop 的 timeout 会自己重传。
 			if errors.Is(err, syscall.ECONNREFUSED) ||
 				errors.Is(err, syscall.EHOSTUNREACH) ||
 				errors.Is(err, syscall.ENETUNREACH) {
@@ -541,10 +671,9 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 				continue
 			}
 			if msg.Rcode != dns.RcodeSuccess {
-				// FormErr / ServFail / Refused mean the server no longer
-				// recognises this session (restarted, or encoding mismatch
-				// after re-handshake). Tear the tunnel down so dataLoop
-				// exits and the caller can reconnect with a fresh session.
+				// FormErr / ServFail / Refused 意味着服务端已经不认这个
+				// session 了（重启了、或者编码协商出现不一致）。立刻拆
+				// tunnel 让 dataLoop 退出,外层重连。
 				if msg.Rcode == dns.RcodeFormatError ||
 					msg.Rcode == dns.RcodeServerFailure ||
 					msg.Rcode == dns.RcodeRefused {
@@ -554,10 +683,12 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 					c.tunnelUp = false
 					return
 				}
+				// 其它非 success rcode（如 NXDOMAIN）忽略,等下次响应。
 				continue
 			}
 			raw, err := c.extractAnswer(msg)
 			if err == nil && raw != nil {
+				// 复制一份,避免下次 Read 复用 buf 时把数据覆盖了。
 				data := make([]byte, len(raw))
 				copy(data, raw)
 				select {
@@ -572,12 +703,20 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 	}
 }
 
+// asyncSendPoll —— 发一个 P 命令空查询,纯粹捎带 downAck 收下行。
+// 走的是 dataLoop 持有的 conn（不是 c.dnsClient）,fire-and-forget,响应由 dnsRecvLoop 收。
 func (c *DNSClient) asyncSendPoll(conn net.Conn, downAck uint8) {
 	meta := CtrlMeta(cmdPoll, downAck)
 	fqdn := buildFQDN("P", meta, c.sessionID, c.tld)
 	c.asyncSendDNS(conn, fqdn)
 }
 
+// asyncSendStreamData —— 把一段 stream payload 编进 DNS 查询发出去。
+//
+// payload 布局：[streamID(1)] + [raw bytes]
+//   - 先拼字节,再 Vigenère,再按编码 DNS-safe 编码,再切 label 拼 FQDN。
+//
+// meta 用 DataMeta：seq + LastFrag(true) + ack。
 func (c *DNSClient) asyncSendStreamData(conn net.Conn, sid uint8, data []byte, seq, downAck uint8) {
 	payload := make([]byte, 1+len(data))
 	payload[0] = sid
@@ -590,6 +729,11 @@ func (c *DNSClient) asyncSendStreamData(conn net.Conn, sid uint8, data []byte, s
 	c.asyncSendDNS(conn, fqdn)
 }
 
+// asyncSendDNS —— 最底层"打包 + 发 UDP"。
+//
+// 每次都重新生成 CMC（让 QNAME 唯一,避开递归解析器本地缓存）。
+// 选 qtype（TXT or NULL）;加 EDNS OPT 把 UDP 大小提到 4096,避免大下行被截。
+// 不等响应（fire-and-forget）,响应由 dnsRecvLoop 收。
 func (c *DNSClient) asyncSendDNS(conn net.Conn, fqdn string) {
 	qtype := dns.TypeTXT
 	if c.useNULL {
@@ -613,6 +757,8 @@ func (c *DNSClient) asyncSendDNS(conn net.Conn, fqdn string) {
 	conn.Write(data)
 }
 
+// cmdOpenStream —— 通知服务端给指定 streamID dial 真实 TCP 目标。
+// 同步等响应,服务端 dial 最长 10s（dialer Timeout）。响应非 "OK" 即视为失败。
 func (c *DNSClient) cmdOpenStream(sid uint8) error {
 	meta := CtrlMeta(cmdOpenStream, sid)
 	fqdn := buildFQDN("O", meta, c.sessionID, c.tld)
@@ -626,12 +772,24 @@ func (c *DNSClient) cmdOpenStream(sid uint8) error {
 	return nil
 }
 
+// cmdCloseStream —— 通知服务端关 stream。fire-and-forget（不重试,丢了无所谓）。
+// 走独立的 c.dnsClient 而不是 dataLoop 的 socket,避免和 dataLoop 抢 socket。
 func (c *DNSClient) cmdCloseStream(sid uint8) {
 	meta := CtrlMeta(cmdCloseStream, sid)
 	fqdn := buildFQDN("X", meta, c.sessionID, c.tld)
 	c.sendDNSOnce(fqdn)
 }
 
+// handshake —— 5 步握手,详见 DESIGN.md §5。
+//
+// 每一步用同步 sendDNS 等响应；任一步失败导致 setupTunnel 失败。
+//
+// 步骤：
+//  1. cmdVersion           : 拿到服务端默认 maxFrag。
+//  2. testNULLRecord       : 探测 NULL 记录支持（成功则升级 maxFrag 到 maxDownPayloadNULL）。
+//  3. testEncoding(Base64) : 探测 Base64URL 上行（成功则升级 encoding,扩大 upPayload）。
+//  4. probeFragSize        : 二分探测下行 fragsize,然后 commitFragSize 通知服务端。
+//  5. cmdLazy + cmdCompress: 启用 lazy hold + zlib 压缩；任一失败仅打印,不致命。
 func (c *DNSClient) handshake() error {
 	meta := CtrlMeta(cmdVersion, protoVersion)
 	fqdn := buildFQDN("V", meta, c.sessionID, c.tld)
@@ -642,6 +800,7 @@ func (c *DNSClient) handshake() error {
 	if c.debug {
 		log.Printf("Version response: %q", string(resp))
 	}
+	// 服务端返回 "V,<ver>,<maxfraghex>"；解第 3 段作为初始 maxFrag。
 	if resp != nil && len(resp) > 0 && resp[0] == 'V' {
 		parts := strings.Split(string(resp), ",")
 		if len(parts) >= 3 {
@@ -673,6 +832,7 @@ func (c *DNSClient) handshake() error {
 
 	probed := c.probeFragSize()
 	if probed > 0 {
+		// commit 用的 maxFrag 要扣掉 downPktHeaderSize（5 字节）。
 		c.maxFrag = probed - downPktHeaderSize
 		if c.maxFrag < 100 {
 			c.maxFrag = probed
@@ -680,6 +840,7 @@ func (c *DNSClient) handshake() error {
 		if c.debug {
 			log.Printf("Probed fragsize: %d (payload max %d)", probed, c.maxFrag)
 		}
+		// commit 失败不致命,服务端按默认 maxFrag 切片,只是吞吐少一点。
 		if err := c.commitFragSize(probed); err != nil && c.debug {
 			log.Printf("Fragsize commit failed: %v (server will use default maxfrag)", err)
 		}
@@ -706,6 +867,10 @@ func (c *DNSClient) handshake() error {
 	return nil
 }
 
+// testNULLRecord —— 用一个 NULL 类型查询试探链路是否支持 NULL 记录。
+//
+// 直接走 c.dnsClient.Exchange,不走 sendDNSRetries（NULL 失败不需要重试,
+// 失败就是失败,回退到 TXT）。返回 true 表示服务端用 dns.NULL 类型成功回复了。
 func (c *DNSClient) testNULLRecord() bool {
 	meta := CtrlMeta(cmdRecType, 1)
 	fqdn := generateCMC() + "." + buildFQDN("N", meta, c.sessionID, c.tld)
@@ -726,12 +891,19 @@ func (c *DNSClient) testNULLRecord() bool {
 	if r.Rcode != dns.RcodeSuccess || len(r.Answer) == 0 {
 		return false
 	}
+	// 必须是 NULL 类型,不能是 TXT。
 	if _, ok := r.Answer[0].(*dns.NULL); ok {
 		return true
 	}
 	return false
 }
 
+// testEncoding —— 测试递归链路对 Base64URL 编码的"忠实度"。
+//
+// 把固定的 8 字节模式 {0x00,0x55,0xAA,0xFF,0x01,0x7F,0x80,0xFE} 编进 QNAME,
+// 服务端按 Base64 解码后逐字节比对。如果递归解析器做了 0x20 大小写改写、
+// 把 +/= 改写为 -_、或者把全 0 / 全 1 字节做 ASCII 处理,这里都会失败。
+// 失败就保留 Base32。
 func (c *DNSClient) testEncoding(enc int) bool {
 	testData := []byte{0x00, 0x55, 0xAA, 0xFF, 0x01, 0x7F, 0x80, 0xFE}
 	encoded := encodeDNSSafe(testData, enc)
@@ -750,6 +922,12 @@ func (c *DNSClient) testEncoding(enc int) bool {
 	return false
 }
 
+// probeFragSize —— 二分查找下行 fragsize 上限。
+//
+// 范围 [100, 1200]（TXT 收窄到 [100, 300]）;每次 testFragSize 让服务端
+// 造对应大小的 probe 数据返回,客户端比对长度是否 >= size。
+//
+// 返回值 = 探到的最大稳定大小 - 2（留点裕度,避免边界波动）；< 100 视为探测失败。
 func (c *DNSClient) probeFragSize() int {
 	lo, hi := 100, 1200
 	if c.useNULL {
@@ -775,6 +953,8 @@ func (c *DNSClient) probeFragSize() int {
 	return best - 2
 }
 
+// testFragSize —— 让服务端造一段 size 字节的 probe 数据,看回包是否真有那么大。
+// 失败可能是路径上 EDNS UDP 阈值小于 size,或者中间设备截断了大 UDP。
 func (c *DNSClient) testFragSize(size int) bool {
 	sizeStr := formatSize(size)
 	meta := CtrlMeta(cmdFragSize, 0)
@@ -787,8 +967,9 @@ func (c *DNSClient) testFragSize(size int) bool {
 	return len(resp) >= size
 }
 
-// commitFragSize tells the server to use `size` as its downstream max payload.
-// param=1 distinguishes commit from probe (param=0).
+// commitFragSize —— 把探测到的 size commit 到服务端 session.maxFrag。
+// param=1 是 commit 的标记（param=0 是 probe）。漏发这一步会让服务端按
+// 默认 500 切片,客户端二分白做,下行吞吐被卡——这是 DESIGN.md §14 #9 的 bug。
 func (c *DNSClient) commitFragSize(size int) error {
 	sizeStr := formatSize(size)
 	meta := CtrlMeta(cmdFragSize, 1)
@@ -803,14 +984,20 @@ func (c *DNSClient) commitFragSize(size int) error {
 	return nil
 }
 
+// sendDNSFew —— 重试 3 次的同步发送（用于握手探测,失败容忍度高）。
 func (c *DNSClient) sendDNSFew(fqdn string) ([]byte, error) {
 	return c.sendDNSRetries(fqdn, 3)
 }
 
+// sendDNS —— 重试 maxRetries (10) 次的同步发送（用于 cmdOpenStream 等关键命令）。
 func (c *DNSClient) sendDNS(fqdn string) ([]byte, error) {
 	return c.sendDNSRetries(fqdn, maxRetries)
 }
 
+// sendDNSRetries —— 通用同步 DNS 发送 + 重试。
+//
+// 每次重试都重新生成 CMC（让 QNAME 不同,绕开递归解析器缓存）。
+// 仅对 i/o timeout 做 sleep retry,其它错误立即返回。
 func (c *DNSClient) sendDNSRetries(fqdn string, retries int) ([]byte, error) {
 	qtype := dns.TypeTXT
 	if c.useNULL {
@@ -849,6 +1036,7 @@ func (c *DNSClient) sendDNSRetries(fqdn string, retries int) ([]byte, error) {
 	return nil, fmt.Errorf("max retries")
 }
 
+// sendDNSOnce —— 同步发一次,不重试。用于 cmdCloseStream 这种"丢了无所谓"的通知。
 func (c *DNSClient) sendDNSOnce(fqdn string) ([]byte, error) {
 	qtype := dns.TypeTXT
 	if c.useNULL {
@@ -875,6 +1063,10 @@ func (c *DNSClient) sendDNSOnce(fqdn string) ([]byte, error) {
 	return c.extractAnswer(r)
 }
 
+// extractAnswer —— 从 dns.Msg 抽出 RDATA。
+//
+// 支持的记录类型：NULL（rdata 是原始字节）和 TXT（rdata 是若干字符串拼起来）。
+// 其它类型返回 (nil, nil)（不报错,继续等下一个响应）。
 func (c *DNSClient) extractAnswer(r *dns.Msg) ([]byte, error) {
 	if len(r.Answer) == 0 {
 		return nil, nil
@@ -888,6 +1080,18 @@ func (c *DNSClient) extractAnswer(r *dns.Msg) ([]byte, error) {
 	return nil, nil
 }
 
+// decodeResponse —— 把服务端发来的 RDATA 解成 DownPkt。
+//
+// 处理几种特殊响应：
+//   - "x"、"EMPTY"、"OK"、"ERR"：控制类应答,不是 DownPkt,返回 nil 让 dataLoop 当 idle 处理。
+//     "x" 是历史遗留的 dummy 响应（详见 DESIGN.md §7.2 / §14.0）,现在服务端已经不再发,
+//     但保留客户端解码兼容,避免和旧服务端通信时崩。
+//   - "CLOSED"：服务端通知会话关闭,返回构造的 Closed DownPkt。
+//
+// 正常路径：
+//  1. NULL 模式直接用 raw；TXT 模式先 DNS-safe decode。
+//  2. Vigenère 解密。
+//  3. DecodeDownPkt 解头。如果 Compressed flag 置位,ZlibDecompress payload。
 func (c *DNSClient) decodeResponse(raw []byte) *DownPkt {
 	if raw == nil || len(raw) == 0 {
 		return nil
