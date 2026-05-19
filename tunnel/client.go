@@ -287,11 +287,12 @@ func (c *DNSClient) streamWriter(stream *clientStream) {
 		data := stream.downBuf.Take(64 * 1024)
 		if len(data) > 0 {
 			stream.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			_, err := stream.conn.Write(data)
+			n, err := stream.conn.Write(data)
 			stream.conn.SetWriteDeadline(time.Time{})
 			if err != nil {
 				if c.debug {
-					log.Printf("TCP write error (stream %d): %v", stream.id, err)
+					log.Printf("stream %d: TCP write error after %d/%d bytes: %v",
+						stream.id, n, len(data), err)
 				}
 				c.mu.Lock()
 				stream.closed = true
@@ -302,6 +303,10 @@ func (c *DNSClient) streamWriter(stream *clientStream) {
 				go c.cmdCloseStream(stream.id)
 				return
 			}
+			if c.debug {
+				log.Printf("stream %d: TCP wrote %d bytes (downBuf remaining=%d)",
+					stream.id, n, stream.downBuf.Len())
+			}
 			continue
 		}
 		c.mu.Lock()
@@ -309,10 +314,16 @@ func (c *DNSClient) streamWriter(stream *clientStream) {
 		closing := stream.closing
 		c.mu.Unlock()
 		if closed {
+			if c.debug {
+				log.Printf("stream %d: writer exiting (closed=true)", stream.id)
+			}
 			return
 		}
 		if closing {
 			// 缓冲已经空了,且服务端已经发过 EOF,可以真正关 socket。
+			if c.debug {
+				log.Printf("stream %d: writer drained, closing-then-close → close TCP", stream.id)
+			}
 			c.mu.Lock()
 			stream.closed = true
 			c.mu.Unlock()
@@ -390,12 +401,19 @@ func (c *DNSClient) streamReader(stream *clientStream) {
 		n, err := stream.conn.Read(buf)
 		if n > 0 {
 			stream.upBuf.Write(buf[:n])
+			if c.debug {
+				log.Printf("stream %d: TCP read %d bytes → upBuf (now=%d)",
+					stream.id, n, stream.upBuf.Len())
+			}
 			select {
 			case c.upNotify <- struct{}{}:
 			default:
 			}
 		}
 		if err != nil {
+			if c.debug {
+				log.Printf("stream %d: TCP read error/EOF: %v (sending cmdCloseStream)", stream.id, err)
+			}
 			c.mu.Lock()
 			stream.closed = true
 			delete(c.streams, stream.id)
@@ -438,6 +456,10 @@ func (c *DNSClient) selectUpstream() (uint8, []byte) {
 		if stream.upBuf.Len() > 0 {
 			data := stream.upBuf.Take(maxData)
 			c.lastUpSched = sid
+			if c.debug {
+				log.Printf("selectUpstream: picked sid=%d len=%d (start=%d, upBuf remaining=%d)",
+					sid, len(data), start, stream.upBuf.Len())
+			}
 			return sid, data
 		}
 	}
@@ -490,6 +512,10 @@ func (c *DNSClient) dataLoop() {
 	// 都没有的话发 poll。
 	send := func() {
 		if !upAcked && lastUpData != nil {
+			if c.debug {
+				log.Printf("send: retransmit unacked sid=%d seq=%d len=%d ack=%d",
+					lastUpSID, upSeq, len(lastUpData), downAck)
+			}
 			c.asyncSendStreamData(conn, lastUpSID, lastUpData, upSeq, downAck)
 		} else {
 			sid, data := c.selectUpstream()
@@ -497,8 +523,14 @@ func (c *DNSClient) dataLoop() {
 				lastUpSID = sid
 				lastUpData = data
 				upAcked = false
+				if c.debug {
+					log.Printf("send: new data sid=%d seq=%d len=%d ack=%d", sid, upSeq, len(data), downAck)
+				}
 				c.asyncSendStreamData(conn, sid, data, upSeq, downAck)
 			} else {
+				if c.debug {
+					log.Printf("send: poll (no upstream data) ack=%d", downAck)
+				}
 				c.asyncSendPoll(conn, downAck)
 			}
 		}
@@ -519,17 +551,34 @@ func (c *DNSClient) dataLoop() {
 		case raw := <-recvCh:
 			inFlight = false
 			pkt := c.decodeResponse(raw)
-			if pkt != nil {
+			if pkt == nil {
+				if c.debug {
+					log.Printf("recv: decode failed (len=%d), skip", len(raw))
+				}
+			} else {
+				if c.debug {
+					log.Printf("recv: pkt seq=%d ack=%d sid=%d payload=%d flags=%s",
+						pkt.Seq, pkt.Ack, pkt.StreamID, len(pkt.Payload), pktFlags(pkt))
+				}
 				c.processDown(pkt, &downAck, &downInited, &lastDownSeq)
 				if !upAcked && pkt.Ack == upSeq {
+					if c.debug {
+						log.Printf("  ack accepted: upSeq %d → %d", upSeq, nextSeq(upSeq))
+					}
 					upAcked = true
 					upSeq = nextSeq(upSeq)
 					lastUpData = nil
+				} else if !upAcked && c.debug {
+					log.Printf("  ack mismatch: got=%d want=%d (still waiting, will retransmit)",
+						pkt.Ack, upSeq)
 				}
 			}
 
 			// processDown 里如果收到 Closed 标志会把 tunnelUp 置 false。
 			if !c.tunnelUp {
+				if c.debug {
+					log.Printf("recv: tunnelUp=false after processDown, dataLoop exiting")
+				}
 				return
 			}
 
@@ -543,25 +592,62 @@ func (c *DNSClient) dataLoop() {
 			// 否则违反 1-in-flight；下一次 recvCh 触发 send() 时 selectUpstream
 			// 也会取到这些字节,数据不会丢。
 			if !inFlight && upAcked {
+				if c.debug {
+					log.Printf("upNotify: triggering send (inFlight=false upAcked=true)")
+				}
 				send()
+			} else if c.debug {
+				log.Printf("upNotify: gated (inFlight=%v upAcked=%v) — will be picked up on next recv",
+					inFlight, upAcked)
 			}
 
 		case <-time.After(timeout):
 			// 上一次发包后既没收到响应,也没有 upNotify 触发——要么响应丢了,
 			// 要么真的空闲（lazy 模式应该有 lazy hold 兜着,正常不会到这里）。
 			if !inFlight {
+				if c.debug {
+					log.Printf("timeout(%v): no inflight, idle send", timeout)
+				}
 				send()
 			} else {
 				// 怀疑响应丢失：重传同一帧而不是发新帧。
 				// 重传时不消耗新的 upSeq,服务端去重层会按 QNAME 命中缓存。
 				if !upAcked && lastUpData != nil {
+					if c.debug {
+						log.Printf("timeout(%v): response lost, retransmit sid=%d seq=%d len=%d",
+							timeout, lastUpSID, upSeq, len(lastUpData))
+					}
 					c.asyncSendStreamData(conn, lastUpSID, lastUpData, upSeq, downAck)
 				} else {
+					if c.debug {
+						log.Printf("timeout(%v): response lost, retransmit poll ack=%d", timeout, downAck)
+					}
 					c.asyncSendPoll(conn, downAck)
 				}
 			}
 		}
 	}
+}
+
+// pktFlags —— 把 DownPkt 标志拼成易读字符串,只给日志用。
+func pktFlags(p *DownPkt) string {
+	var flags []string
+	if p.LastFrag {
+		flags = append(flags, "LF")
+	}
+	if p.Compressed {
+		flags = append(flags, "Z")
+	}
+	if p.Closed {
+		flags = append(flags, "CLOSED")
+	}
+	if p.StreamClosed {
+		flags = append(flags, "SCLOSED")
+	}
+	if len(flags) == 0 {
+		return "[-]"
+	}
+	return "[" + strings.Join(flags, " ") + "]"
 }
 
 // processDown —— 处理一个解码好的 DownPkt：更新 ack、把 payload 塞进对应 stream 的 downBuf。
@@ -576,6 +662,9 @@ func (c *DNSClient) dataLoop() {
 // **去重**：pkt.Seq == lastDownSeq 表示同 seq 重传,跳过 payload 处理（避免重复写）。
 func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, lastDownSeq *uint8) {
 	if pkt.Closed {
+		if c.debug {
+			log.Printf("  Closed flag set: session ended by server, tearing down")
+		}
 		c.tunnelUp = false
 		return
 	}
@@ -597,14 +686,15 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 			}
 		}
 		if c.debug {
-			log.Printf("Server closed stream %d", pkt.StreamID)
+			log.Printf("  StreamClosed sid=%d (closing-then-close, found=%v)", pkt.StreamID, ok)
 		}
 	}
 
 	if len(pkt.Payload) > 0 && pkt.StreamID > 0 {
 		// 新 seq 才处理；同 seq 是 DNS 重传或 UDP 重复,跳过 payload。
 		if !*downInited || pkt.Seq != *lastDownSeq {
-			if !*downInited {
+			firstTime := !*downInited
+			if firstTime {
 				*downInited = true
 			}
 			c.mu.Lock()
@@ -617,10 +707,22 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 				case stream.downSig <- struct{}{}:
 				default:
 				}
+				if c.debug {
+					log.Printf("  payload → stream %d (%d bytes, downAck %d → %d%s)",
+						pkt.StreamID, len(pkt.Payload), *downAck, pkt.Seq,
+						map[bool]string{true: ", first downpkt"}[firstTime])
+				}
+			} else if c.debug {
+				log.Printf("  payload dropped: stream %d not found or closed (%d bytes lost)",
+					pkt.StreamID, len(pkt.Payload))
 			}
 			*downAck = pkt.Seq
 			*lastDownSeq = pkt.Seq
+		} else if c.debug {
+			log.Printf("  dedup: same downSeq=%d, skip payload (%d bytes)", pkt.Seq, len(pkt.Payload))
 		}
+	} else if c.debug && pkt.StreamID == 0 && len(pkt.Payload) > 0 {
+		log.Printf("  payload on sid=0 (control response, %d bytes), ignored in dataLoop path", len(pkt.Payload))
 	}
 }
 
@@ -668,7 +770,18 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 		if n > 0 {
 			msg := new(dns.Msg)
 			if err := msg.Unpack(buf[:n]); err != nil {
+				if c.debug {
+					log.Printf("DNS recv: unpack error: %v (raw %d bytes)", err, n)
+				}
 				continue
+			}
+			if c.debug {
+				qname := ""
+				if len(msg.Question) > 0 {
+					qname = msg.Question[0].Name
+				}
+				log.Printf("DNS recv: %d bytes id=%d rcode=%d answers=%d qname=%s",
+					n, msg.Id, msg.Rcode, len(msg.Answer), qname)
 			}
 			if msg.Rcode != dns.RcodeSuccess {
 				// FormErr / ServFail / Refused 意味着服务端已经不认这个
@@ -684,19 +797,35 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 					return
 				}
 				// 其它非 success rcode（如 NXDOMAIN）忽略,等下次响应。
+				if c.debug {
+					log.Printf("  non-success rcode %d, ignoring", msg.Rcode)
+				}
 				continue
 			}
 			raw, err := c.extractAnswer(msg)
-			if err == nil && raw != nil {
-				// 复制一份,避免下次 Read 复用 buf 时把数据覆盖了。
-				data := make([]byte, len(raw))
-				copy(data, raw)
-				select {
-				case ch <- data:
-				case <-time.After(100 * time.Millisecond):
-					if c.debug {
-						log.Printf("recv channel backpressure, dropping packet")
-					}
+			if err != nil {
+				if c.debug {
+					log.Printf("  extractAnswer error: %v", err)
+				}
+				continue
+			}
+			if raw == nil {
+				if c.debug {
+					log.Printf("  empty answer (no NULL/TXT record), drop")
+				}
+				continue
+			}
+			if c.debug {
+				log.Printf("  rdata %d bytes → recvCh", len(raw))
+			}
+			// 复制一份,避免下次 Read 复用 buf 时把数据覆盖了。
+			data := make([]byte, len(raw))
+			copy(data, raw)
+			select {
+			case ch <- data:
+			case <-time.After(100 * time.Millisecond):
+				if c.debug {
+					log.Printf("recv channel backpressure, dropping packet")
 				}
 			}
 		}
@@ -708,6 +837,9 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 func (c *DNSClient) asyncSendPoll(conn net.Conn, downAck uint8) {
 	meta := CtrlMeta(cmdPoll, downAck)
 	fqdn := buildFQDN("P", meta, c.sessionID, c.tld)
+	if c.debug {
+		log.Printf("  poll meta=%s downAck=%d", meta, downAck)
+	}
 	c.asyncSendDNS(conn, fqdn)
 }
 
@@ -726,6 +858,10 @@ func (c *DNSClient) asyncSendStreamData(conn net.Conn, sid uint8, data []byte, s
 	encoded := encodeDNSSafe(encrypted, c.encoding)
 	meta := DataMeta(seq, 0, downAck, true)
 	fqdn := buildFQDN(encoded, meta, c.sessionID, c.tld)
+	if c.debug {
+		log.Printf("  data meta=%s sid=%d seq=%d ack=%d len=%d enc=%d",
+			meta, sid, seq, downAck, len(data), c.encoding)
+	}
 	c.asyncSendDNS(conn, fqdn)
 }
 
@@ -752,9 +888,19 @@ func (c *DNSClient) asyncSendDNS(conn net.Conn, fqdn string) {
 
 	data, err := msg.Pack()
 	if err != nil {
+		if c.debug {
+			log.Printf("  pack error: %v", err)
+		}
 		return
 	}
-	conn.Write(data)
+	if c.debug {
+		log.Printf("DNS send: %s type=%d to=%s len=%d", fqdn, qtype, c.dnsServer, len(data))
+	}
+	if _, err := conn.Write(data); err != nil {
+		if c.debug {
+			log.Printf("  UDP write error: %v", err)
+		}
+	}
 }
 
 // cmdOpenStream —— 通知服务端给指定 streamID dial 真实 TCP 目标。
@@ -762,12 +908,24 @@ func (c *DNSClient) asyncSendDNS(conn net.Conn, fqdn string) {
 func (c *DNSClient) cmdOpenStream(sid uint8) error {
 	meta := CtrlMeta(cmdOpenStream, sid)
 	fqdn := buildFQDN("O", meta, c.sessionID, c.tld)
+	if c.debug {
+		log.Printf("cmdOpenStream %d: meta=%s sending...", sid, meta)
+	}
 	resp, err := c.sendDNS(fqdn)
 	if err != nil {
+		if c.debug {
+			log.Printf("cmdOpenStream %d: send error: %v", sid, err)
+		}
 		return fmt.Errorf("stream open: %v", err)
 	}
 	if resp == nil || string(resp) != "OK" {
+		if c.debug {
+			log.Printf("cmdOpenStream %d: server rejected: %q", sid, string(resp))
+		}
 		return fmt.Errorf("stream open rejected: %s", string(resp))
+	}
+	if c.debug {
+		log.Printf("cmdOpenStream %d: server OK", sid)
 	}
 	return nil
 }
@@ -777,6 +935,9 @@ func (c *DNSClient) cmdOpenStream(sid uint8) error {
 func (c *DNSClient) cmdCloseStream(sid uint8) {
 	meta := CtrlMeta(cmdCloseStream, sid)
 	fqdn := buildFQDN("X", meta, c.sessionID, c.tld)
+	if c.debug {
+		log.Printf("cmdCloseStream %d: meta=%s (fire-and-forget)", sid, meta)
+	}
 	c.sendDNSOnce(fqdn)
 }
 
@@ -1016,22 +1177,41 @@ func (c *DNSClient) sendDNSRetries(fqdn string, retries int) ([]byte, error) {
 		opt.SetUDPSize(4096)
 		msg.Extra = append(msg.Extra, opt)
 
+		if c.debug {
+			log.Printf("sendDNS attempt %d/%d: %s type=%d", attempt, retries, retryFQDN, qtype)
+		}
 		r, _, err := c.dnsClient.Exchange(msg, c.dnsServer)
 		if err != nil {
 			if strings.Contains(err.Error(), "i/o timeout") && attempt < retries {
+				if c.debug {
+					log.Printf("  attempt %d timeout, sleep %v and retry", attempt, retryDelay)
+				}
 				time.Sleep(retryDelay)
 				continue
+			}
+			if c.debug {
+				log.Printf("  attempt %d error: %v (giving up)", attempt, err)
 			}
 			return nil, err
 		}
 		if r.Rcode != dns.RcodeSuccess {
 			if attempt < retries {
+				if c.debug {
+					log.Printf("  attempt %d rcode=%d, sleep %v and retry", attempt, r.Rcode, retryDelay)
+				}
 				time.Sleep(retryDelay)
 				continue
 			}
+			if c.debug {
+				log.Printf("  attempt %d rcode=%d (giving up)", attempt, r.Rcode)
+			}
 			return nil, fmt.Errorf("DNS error %d", r.Rcode)
 		}
-		return c.extractAnswer(r)
+		ans, err := c.extractAnswer(r)
+		if c.debug {
+			log.Printf("  attempt %d ok: rdata=%d bytes", attempt, len(ans))
+		}
+		return ans, err
 	}
 	return nil, fmt.Errorf("max retries")
 }
