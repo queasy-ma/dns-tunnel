@@ -92,11 +92,20 @@ type DNSClient struct {
 	//   - dataLoop / Accept 循环按 Load() 决定是否退出/惰性重连。
 	tunnelUp atomic.Bool
 
-	// 进程级生命周期管理：
+	// 进程级生命周期管理。**runMu 同时保护 running / closed / quit / listener** 四个字段——
+	// 缺一不可,否则 "Close 在 Start 还没跑到时打进来" 这种竞态会让 Start 后续
+	// 重建一个永远没人关的 listener 和 quit channel,造成 goroutine 永久泄漏。
+	//
+	// 不变量：
+	//   - closed=true 表示已经 Close 过；Close 后再 Start 直接返回 error,
+	//     **不支持重启同一实例**（要重启,丢掉旧 *DNSClient,用 NewDNSClient 建新的）。
+	//   - quit / listener 字段的读和"Close + closed 检查"必须在同一个临界区内
+	//     做完,否则会出现 Close 拿到的是旧值、Start 又写了新值的撕裂情景。
+	runMu    sync.RWMutex
+	running  bool
+	closed   bool
 	quit     chan struct{}
 	listener net.Listener
-	running  bool
-	runMu    sync.RWMutex
 }
 
 // NewDNSClient 构造但不启动客户端。listenAddr 是本地 TCP 监听地址,
@@ -140,20 +149,30 @@ func (c *DNSClient) MarkRunning() {
 	c.runMu.Unlock()
 }
 
-// Close 优雅关闭客户端：tunnel down + close quit + close listener。
-// 已经 close 过的 quit 不重复 close（用 select+default 探测）。
+// Close 优雅关闭客户端：tunnel down + close quit + close listener。多次调用安全。
+//
+// 在 runMu 内**同时**置 closed=true + 快照 quit / listener,之后释放锁再做 IO。
+// 这保证了即使 Close 与一个还在 scheduled 状态的 Start goroutine 撞车,Start
+// 也会在 runMu.Lock 内看到 closed=true 然后立即退出,不会建出一个永远没人关的
+// listener / quit 一直泄漏（CGO 场景下的典型"Start 后立即 Stop"路径）。
 func (c *DNSClient) Close() {
 	c.runMu.Lock()
+	c.closed = true
 	c.running = false
+	quit := c.quit
+	listener := c.listener
 	c.runMu.Unlock()
+
 	c.tunnelUp.Store(false)
-	select {
-	case <-c.quit:
-	default:
-		close(c.quit)
+	if quit != nil {
+		select {
+		case <-quit:
+		default:
+			close(quit)
+		}
 	}
-	if c.listener != nil {
-		c.listener.Close()
+	if listener != nil {
+		listener.Close()
 	}
 }
 
@@ -169,9 +188,23 @@ func (c *DNSClient) IsRunning() bool {
 //
 // 错误恢复：dataLoop 发现 tunnelUp=false 后退出；下一个 Accept 时会触发
 // setupTunnel 重新握手 + 重启 dataLoop（"惰性重连"）。
+//
+// 生命周期：
+//   - 同一 *DNSClient 实例**最多 Start 一次**。Close 后再 Start 直接返回 error,
+//     需要重启请用 NewDNSClient 建新实例。
+//   - Start 内对 quit / listener 的写入都在 runMu 临界区内完成,且会立即检查
+//     closed 标志,确保 "Close 抢先" 的场景下不会建出永远没人关的资源。
 func (c *DNSClient) Start() error {
-	c.quit = make(chan struct{})
+	// 第 1 道闸：注册 quit + running。如果已被 Close 过,直接拒绝。
 	c.runMu.Lock()
+	if c.closed {
+		c.runMu.Unlock()
+		return fmt.Errorf("client has been closed; create a new DNSClient to restart")
+	}
+	if c.quit == nil {
+		c.quit = make(chan struct{})
+	}
+	quit := c.quit
 	c.running = true
 	c.runMu.Unlock()
 	defer func() {
@@ -184,7 +217,18 @@ func (c *DNSClient) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen failed: %v", err)
 	}
+
+	// 第 2 道闸：listen 成功后 publish 之前再检查一次 closed。
+	// 如果 Close 在 net.Listen 期间打进来（看到 listener=nil 而跳过 listener.Close）,
+	// 这里我们自己关掉刚建出来的 listener,避免泄漏。
+	c.runMu.Lock()
+	if c.closed {
+		c.runMu.Unlock()
+		listener.Close()
+		return nil
+	}
 	c.listener = listener
+	c.runMu.Unlock()
 	defer listener.Close()
 
 	if c.debug {
@@ -199,8 +243,10 @@ func (c *DNSClient) Start() error {
 
 	for {
 		// 每次 Accept 前先检查 quit,防止 listener.Close 后还在傻 Accept。
+		// 用本地 `quit` 而不是 c.quit,避免与并发 Start 的写竞争（虽然现在
+		// Start 不允许重入,但本地变量更可读且未来更鲁棒）。
 		select {
-		case <-c.quit:
+		case <-quit:
 			return nil
 		default:
 		}
@@ -208,7 +254,7 @@ func (c *DNSClient) Start() error {
 		if err != nil {
 			// Close() 走的就是 listener.Close()→Accept 返回 err 的路径。
 			select {
-			case <-c.quit:
+			case <-quit:
 				return nil
 			default:
 			}

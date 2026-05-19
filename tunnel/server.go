@@ -406,8 +406,8 @@ func (s *Session) saveToQmem(cmc string) {
 //   - domain           ：NS 委派模式下的服务端域（"t.example.com"）；空表示直连模式。
 //   - parentDomain     ：domain 的父域,用于 SOA/NS 回包。
 //   - domainPartsCount ：domain 用 "." 切的段数,handleDNSRequest 从尾部切掉这么多段还原 tunnelParts。
-//   - dnsServerInst    ：miekg/dns 的 server 实例,Close 时调 Shutdown 优雅退出;instMu 保护。
-//   - quit / running   ：作为库使用时的生命周期状态;runMu 保护。
+//   - dnsServerInst / quit / running / closed ：作为库使用时的生命周期状态,
+//     全部由 runMu 保护（早期分两把锁导致 Close/Start 间留竞态窗口,见下方字段注释）。
 //
 // 作为库使用时（同进程多实例 / 反复启停）：
 //   - 用独立的 dns.ServeMux 而不是包全局 mux,避免多实例互相覆盖 handler。
@@ -423,12 +423,17 @@ type DNSServer struct {
 	parentDomain     string
 	domainPartsCount int
 
-	instMu        sync.Mutex
+	// 生命周期字段。**runMu 同时保护 running / closed / quit / dnsServerInst**。
+	// 以前 dnsServerInst 单独放在 instMu 下,但与 runMu(closed/quit) 是两把锁,
+	// 给 Close 与 Start 之间留出竞态窗口（Close 看到 dnsServerInst=nil 跳过
+	// Shutdown,Start 接着 publish 了 dnsServerInst 然后阻塞 ListenAndServe,
+	// 永远没人 Shutdown）。合到一把锁后,"check closed + publish dnsServerInst"
+	// 可以在同一临界区原子完成。
+	runMu         sync.RWMutex
+	running       bool
+	closed        bool
+	quit          chan struct{}
 	dnsServerInst *dns.Server
-
-	runMu   sync.RWMutex
-	running bool
-	quit    chan struct{}
 }
 
 // NewDNSServer —— 构造服务端。
@@ -456,24 +461,29 @@ func NewDNSServer(dnsListener, tcpDest string, debug bool, key string, domain st
 }
 
 // Close —— 优雅停止 DNS 监听 + 通知 cleanupSessions 退出。多次调用安全。
-// 已经建立的 session 不会被立即销毁（仍在 sessions map 里）,Start 重启时
-// 会复用原 map；要彻底清理需调用方在 Close 后丢弃整个 DNSServer 实例。
+// 已经建立的 session 不会被立即销毁（仍在 sessions map 里）；要彻底清理需调用方
+// 在 Close 后丢弃整个 DNSServer 实例。
+//
+// 在 runMu 内**同时**置 closed=true + 快照 quit / dnsServerInst,之后释放锁
+// 再做 IO。这保证了即使 Close 与一个还在 scheduled 状态的 Start goroutine 撞车,
+// Start 也会在 runMu.Lock 内看到 closed=true,不再 publish dnsServerInst,
+// 也不会阻塞 ListenAndServe。
 func (s *DNSServer) Close() {
 	s.runMu.Lock()
+	s.closed = true
 	s.running = false
-	if s.quit != nil {
-		select {
-		case <-s.quit:
-		default:
-			close(s.quit)
-		}
-	}
-	s.runMu.Unlock()
-
-	s.instMu.Lock()
+	quit := s.quit
 	inst := s.dnsServerInst
 	s.dnsServerInst = nil
-	s.instMu.Unlock()
+	s.runMu.Unlock()
+
+	if quit != nil {
+		select {
+		case <-quit:
+		default:
+			close(quit)
+		}
+	}
 	if inst != nil {
 		inst.Shutdown()
 	}
@@ -500,10 +510,23 @@ func (s *DNSServer) MarkRunning() {
 //
 // 使用自有 dns.ServeMux 而不是包全局 mux,允许同进程多 DNSServer 实例
 // 各自路由互不干扰（包全局 mux 会让后注册的 handler 覆盖先注册的）。
+//
+// 生命周期：
+//   - 同一 *DNSServer 实例**最多 Start 一次**。Close 后再 Start 直接返回 error,
+//     需要重启请用 NewDNSServer 建新实例。
+//   - Start 内对 dnsServerInst 的发布与 closed 检查在同一个 runMu 临界区内完成,
+//     避免 Close 抢先 / 错过 inst 而后 ListenAndServe 永远没人 Shutdown。
 func (s *DNSServer) Start() error {
+	// 第 1 道闸：注册 quit + running。如果已被 Close 过,直接拒绝。
 	s.runMu.Lock()
+	if s.closed {
+		s.runMu.Unlock()
+		return fmt.Errorf("server has been closed; create a new DNSServer to restart")
+	}
 	s.running = true
-	s.quit = make(chan struct{})
+	if s.quit == nil {
+		s.quit = make(chan struct{})
+	}
 	quit := s.quit
 	s.runMu.Unlock()
 	defer func() {
@@ -518,9 +541,16 @@ func (s *DNSServer) Start() error {
 	mux.HandleFunc(".", s.handleDNSRequest)
 	server := &dns.Server{Addr: s.dnsListener, Net: "udp", Handler: mux}
 
-	s.instMu.Lock()
+	// 第 2 道闸：publish dnsServerInst 与 closed 检查在同一把锁下原子完成。
+	// 如果 Close 在 quit 释放后 / 这里之前打进来,它看到 dnsServerInst=nil 跳过
+	// Shutdown,但接下来 closed=true,我们这里直接返回,不会阻塞 ListenAndServe。
+	s.runMu.Lock()
+	if s.closed {
+		s.runMu.Unlock()
+		return nil
+	}
 	s.dnsServerInst = server
-	s.instMu.Unlock()
+	s.runMu.Unlock()
 
 	if s.debug {
 		log.Printf("DNS server on %s (UDP)", s.dnsListener)
