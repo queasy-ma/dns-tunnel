@@ -406,7 +406,12 @@ func (s *Session) saveToQmem(cmc string) {
 //   - domain           ：NS 委派模式下的服务端域（"t.example.com"）；空表示直连模式。
 //   - parentDomain     ：domain 的父域,用于 SOA/NS 回包。
 //   - domainPartsCount ：domain 用 "." 切的段数,handleDNSRequest 从尾部切掉这么多段还原 tunnelParts。
-//   - dnsServerInst    ：miekg/dns 的 server 实例,Close 时调 Shutdown 优雅退出。
+//   - dnsServerInst    ：miekg/dns 的 server 实例,Close 时调 Shutdown 优雅退出;instMu 保护。
+//   - quit / running   ：作为库使用时的生命周期状态;runMu 保护。
+//
+// 作为库使用时（同进程多实例 / 反复启停）：
+//   - 用独立的 dns.ServeMux 而不是包全局 mux,避免多实例互相覆盖 handler。
+//   - cleanupSessions goroutine 监听 quit 退出,不会随 Close 泄漏。
 type DNSServer struct {
 	dnsListener      string
 	tcpDest          string
@@ -417,7 +422,13 @@ type DNSServer struct {
 	domain           string
 	parentDomain     string
 	domainPartsCount int
-	dnsServerInst    *dns.Server
+
+	instMu        sync.Mutex
+	dnsServerInst *dns.Server
+
+	runMu   sync.RWMutex
+	running bool
+	quit    chan struct{}
 }
 
 // NewDNSServer —— 构造服务端。
@@ -444,20 +455,73 @@ func NewDNSServer(dnsListener, tcpDest string, debug bool, key string, domain st
 	}
 }
 
-// Close —— 优雅停止 DNS 监听。已有 session 不会被强制关闭,
-// cleanupSessions goroutine 在程序退出时随主程一起被回收。
+// Close —— 优雅停止 DNS 监听 + 通知 cleanupSessions 退出。多次调用安全。
+// 已经建立的 session 不会被立即销毁（仍在 sessions map 里）,Start 重启时
+// 会复用原 map；要彻底清理需调用方在 Close 后丢弃整个 DNSServer 实例。
 func (s *DNSServer) Close() {
-	if s.dnsServerInst != nil {
-		s.dnsServerInst.Shutdown()
+	s.runMu.Lock()
+	s.running = false
+	if s.quit != nil {
+		select {
+		case <-s.quit:
+		default:
+			close(s.quit)
+		}
+	}
+	s.runMu.Unlock()
+
+	s.instMu.Lock()
+	inst := s.dnsServerInst
+	s.dnsServerInst = nil
+	s.instMu.Unlock()
+	if inst != nil {
+		inst.Shutdown()
 	}
 }
 
+// IsRunning —— 用 RLock 允许并发查询,与 DNSClient.IsRunning 语义对齐。
+func (s *DNSServer) IsRunning() bool {
+	s.runMu.RLock()
+	defer s.runMu.RUnlock()
+	return s.running
+}
+
+// MarkRunning —— 给外部库使用者用的"我打算 Start 了"标记。
+// 普通命令行模式下 Start 内部会自己置位,无需手动调用；库场景下
+// `go server.Start()` 与 `IsRunning()` 查询之间会有竞态窗口,这个方法
+// 在 goroutine 里调 Start 前主线程先调一下,即可消除窗口。
+func (s *DNSServer) MarkRunning() {
+	s.runMu.Lock()
+	s.running = true
+	s.runMu.Unlock()
+}
+
 // Start —— 启动后台清理 + DNS UDP 监听。阻塞调用,返回即代表致命错误。
+//
+// 使用自有 dns.ServeMux 而不是包全局 mux,允许同进程多 DNSServer 实例
+// 各自路由互不干扰（包全局 mux 会让后注册的 handler 覆盖先注册的）。
 func (s *DNSServer) Start() error {
-	go s.cleanupSessions()
-	dns.HandleFunc(".", s.handleDNSRequest)
-	server := &dns.Server{Addr: s.dnsListener, Net: "udp"}
+	s.runMu.Lock()
+	s.running = true
+	s.quit = make(chan struct{})
+	quit := s.quit
+	s.runMu.Unlock()
+	defer func() {
+		s.runMu.Lock()
+		s.running = false
+		s.runMu.Unlock()
+	}()
+
+	go s.cleanupSessions(quit)
+
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", s.handleDNSRequest)
+	server := &dns.Server{Addr: s.dnsListener, Net: "udp", Handler: mux}
+
+	s.instMu.Lock()
 	s.dnsServerInst = server
+	s.instMu.Unlock()
+
 	if s.debug {
 		log.Printf("DNS server on %s (UDP)", s.dnsListener)
 	}
@@ -1386,21 +1450,26 @@ func (s *DNSServer) handleStandardQuery(w dns.ResponseWriter, r *dns.Msg, msg *d
 // 如果某个 session 还有 handler 在运行（典型：lazyhold 等下行）,Close 会先
 // 把 closed=true 设上,handler 后续的检查会让它走 Closed 路径退出,inflight
 // defer 仍然摘槽 + close(done),没有泄漏。
-func (s *DNSServer) cleanupSessions() {
+func (s *DNSServer) cleanupSessions(quit <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.mu.Lock()
-		now := time.Now()
-		for id, session := range s.sessions {
-			if session.IsClosed() || now.Sub(session.lastActive) > 5*time.Minute {
-				if s.debug {
-					log.Printf("Cleanup session %s", id)
+	for {
+		select {
+		case <-quit:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			now := time.Now()
+			for id, session := range s.sessions {
+				if session.IsClosed() || now.Sub(session.lastActive) > 5*time.Minute {
+					if s.debug {
+						log.Printf("Cleanup session %s", id)
+					}
+					session.Close()
+					delete(s.sessions, id)
 				}
-				session.Close()
-				delete(s.sessions, id)
 			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 }

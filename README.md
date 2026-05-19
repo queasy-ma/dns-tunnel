@@ -191,4 +191,11 @@ CGO_ENABLED=1 go build -buildmode=c-archive -o libdnstunnel.a .
 # 生成 libdnstunnel.a + libdnstunnel.h
 ```
 
-完整示例见 `example/` 目录。
+完整示例见 `example/` 目录：
+
+- `example/embed-client/`  纯 Go 嵌入 client 的最小示例
+- `example/embed-server/`  纯 Go 嵌入 server 的最小示例
+- `example/cgo-client/`    cgo 静态库 / 共享库形式封装 client（导出 `StartDnsClient` / `StopDnsClient` / `IsDnsClientRunning`）
+- `example/cgo-server/`    cgo 静态库 / 共享库形式封装 server（导出 `StartDnsServer` / `StopDnsServer` / `IsDnsServerRunning`）
+
+每个 cgo example 的文件头注释里写了 Linux / macOS / Windows 三平台的 `-buildmode=c-archive` 和 `-buildmode=c-shared` 命令。

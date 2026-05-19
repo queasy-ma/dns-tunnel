@@ -27,6 +27,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -83,8 +84,13 @@ type DNSClient struct {
 	streams     map[uint8]*clientStream
 	nextSID     uint8 // 下一次 allocStreamIDLocked 的起点
 	lastUpSched uint8 // selectUpstream 的 round-robin 游标
-	tunnelUp    bool  // 隧道存活；dnsRecvLoop 致命错误时会置 false
 	upNotify    chan struct{}
+
+	// tunnelUp：隧道存活,多 goroutine 读写,用 atomic.Bool 消除 data race。
+	//   - Start 握手成功后 Store(true)；
+	//   - dnsRecvLoop / processDown 致命错误 Store(false)；
+	//   - dataLoop / Accept 循环按 Load() 决定是否退出/惰性重连。
+	tunnelUp atomic.Bool
 
 	// 进程级生命周期管理：
 	quit     chan struct{}
@@ -140,7 +146,7 @@ func (c *DNSClient) Close() {
 	c.runMu.Lock()
 	c.running = false
 	c.runMu.Unlock()
-	c.tunnelUp = false
+	c.tunnelUp.Store(false)
 	select {
 	case <-c.quit:
 	default:
@@ -213,7 +219,7 @@ func (c *DNSClient) Start() error {
 		}
 
 		// 上一次 dataLoop 退出（tunnel 死）后,这里惰性重建。
-		if !c.tunnelUp {
+		if !c.tunnelUp.Load() {
 			if c.debug {
 				log.Printf("Tunnel down, re-establishing...")
 			}
@@ -382,7 +388,7 @@ func (c *DNSClient) setupTunnel() error {
 		return err
 	}
 
-	c.tunnelUp = true
+	c.tunnelUp.Store(true)
 
 	if c.debug {
 		log.Printf("Tunnel ready: lazy=%v compress=%v null=%v maxfrag=%d enc=%d",
@@ -475,18 +481,19 @@ func (c *DNSClient) selectUpstream() (uint8, []byte) {
 //   - tunnelUp=false 就退出；外层 Accept 循环会触发重连。
 //
 // 三路 select：
-//   - recvCh：收到 DNS 响应,处理 ack + payload,然后立刻 send 下一个。
-//   - upNotify：streamReader 通知有新上行字节,但**只在 !inFlight && upAcked 时才 send**,
-//     否则下一次 recvCh 触发时 selectUpstream 会自然拿到这些字节。
-//   - timeout：lazy 模式 2s、非 lazy 5s。inFlight=true 表示丢响应,重传同一帧；
-//     inFlight=false 表示真的空闲（异常路径,正常不会触发,因为有 lazy hold）。
+//   - recvCh：收到 DNS 响应,处理 ack + payload；**只在 inFlight==0 时才发下一个**。
+//   - upNotify：streamReader 通知有新上行字节,**只在 inFlight==0 && upAcked 时才 send**。
+//   - timeout：lazy 模式 2s、非 lazy 5s。
+//   - inFlight==0：异常路径（正常应被 server lazy hold 兜住）,补一发。
+//   - inFlight>0：怀疑丢响应,补发一个 retransmit；**不重置 inFlight**,
+//     让 recv 把多发的那个自然消化（详见 timeout 分支注释）。
 func (c *DNSClient) dataLoop() {
 	conn, err := net.Dial("udp", c.dnsServer)
 	if err != nil {
 		if c.debug {
 			log.Printf("DNS dial failed: %v", err)
 		}
-		c.tunnelUp = false
+		c.tunnelUp.Store(false)
 		return
 	}
 	defer conn.Close()
@@ -501,15 +508,25 @@ func (c *DNSClient) dataLoop() {
 	upAcked := true       // 上一帧已被服务端 ack
 	downInited := false   // 是否已经收到过下行,用于 lastDownSeq 初始化
 	var lastDownSeq uint8 // 上次收到的下行 seq,用于去重（同 seq 重传）
-	// inFlight：严格 1-in-flight 不变量的实现。
-	//   - 进 send() = inFlight=true；
-	//   - recv 到任意响应 = inFlight=false。
-	// 没有这个标志,upNotify / timeout 可能触发第二个并发查询,服务端
-	// 看到的就是"同 session 多个并发查询",lazyHeld 兜底会触发 ~10/s 风暴。
-	inFlight := false
+	// inFlight：严格 1-in-flight 不变量。**计数器**,不是布尔。
+	//
+	// 语义：
+	//   - 0：网络上没有未回应的查询,可以自由 send()。
+	//   - 1：稳态（每次 send 后到对应 recv 前）。
+	//   - >1：timeout 重传造成的瞬态;recv 会把它消化掉、**不**触发新 send,
+	//     直到回到 0 才发下一个。
+	//
+	// 历史 bug（DESIGN.md §14 / CLAUDE.md "高频地雷 #2"）：早期是 bool,
+	// timeout 分支直接 c.asyncSend... 重传但 inFlight 不动,等于"幻在途"——
+	// 延迟的原响应回来后客户端立刻 send,网络上稳态 2-in-flight。两个 query
+	// 撞进服务端时,一个占住 lazyHeld 1s,另一个走 concurrentPoll 空响应秒回——
+	// 形成 30/秒 自维持空 poll 风暴。改成计数器 + "inFlight==0 才发"的 gate
+	// 后,timeout 重传只会瞬态 2-in-flight,recv 拿到第一个响应不触发新 send,
+	// 等第二个响应回来 inFlight 回 0,才发下一个。
+	inFlight := 0
 
 	// send —— 发一个查询。优先重传未 ack 的旧帧,否则从 selectUpstream 取新数据,
-	// 都没有的话发 poll。
+	// 都没有的话发 poll。**调用方负责确认 inFlight==0 (或在 timeout 重传场景下接受瞬态 >1)**。
 	send := func() {
 		if !upAcked && lastUpData != nil {
 			if c.debug {
@@ -534,12 +551,12 @@ func (c *DNSClient) dataLoop() {
 				c.asyncSendPoll(conn, downAck)
 			}
 		}
-		inFlight = true
+		inFlight++
 	}
 
 	send()
 
-	for c.tunnelUp {
+	for c.tunnelUp.Load() {
 		timeout := 5 * time.Second
 		if c.lazyMode {
 			// lazy 模式下,服务端会 hold 最多 lazyTimeout(1s),所以客户端 2s 仍未
@@ -549,7 +566,9 @@ func (c *DNSClient) dataLoop() {
 
 		select {
 		case raw := <-recvCh:
-			inFlight = false
+			if inFlight > 0 {
+				inFlight--
+			}
 			pkt := c.decodeResponse(raw)
 			if pkt == nil {
 				if c.debug {
@@ -557,8 +576,8 @@ func (c *DNSClient) dataLoop() {
 				}
 			} else {
 				if c.debug {
-					log.Printf("recv: pkt seq=%d ack=%d sid=%d payload=%d flags=%s",
-						pkt.Seq, pkt.Ack, pkt.StreamID, len(pkt.Payload), pktFlags(pkt))
+					log.Printf("recv: pkt seq=%d ack=%d sid=%d payload=%d flags=%s inFlight=%d",
+						pkt.Seq, pkt.Ack, pkt.StreamID, len(pkt.Payload), pktFlags(pkt), inFlight)
 				}
 				c.processDown(pkt, &downAck, &downInited, &lastDownSeq)
 				if !upAcked && pkt.Ack == upSeq {
@@ -575,56 +594,58 @@ func (c *DNSClient) dataLoop() {
 			}
 
 			// processDown 里如果收到 Closed 标志会把 tunnelUp 置 false。
-			if !c.tunnelUp {
+			if !c.tunnelUp.Load() {
 				if c.debug {
 					log.Printf("recv: tunnelUp=false after processDown, dataLoop exiting")
 				}
 				return
 			}
 
-			// 严格 1-in-flight：每收到一个响应就立刻发下一个。空闲节拍由
-			// server 端 lazy hold(~1s) 决定,client 这里不加 gap——加了会
-			// 让服务端 async 推送（如命令输出）的首字节延迟暴涨。
-			send()
+			// 严格 1-in-flight 关键 gate：只在 inFlight==0 时发下一个。
+			// inFlight>0 说明此前 timeout 多发过 retransmit、网络上还有别的
+			// 响应没回来,**不**触发新 send,等剩下的响应自然消化。
+			// 这是消除自维持空 poll 风暴的核心机制（见上方 inFlight 注释）。
+			if inFlight == 0 {
+				send()
+			} else if c.debug {
+				log.Printf("recv: drain mode, inFlight=%d still pending, no send", inFlight)
+			}
 
 		case <-c.upNotify:
-			// streamReader 通知有新上行字节。只在 !inFlight && upAcked 时发,
+			// streamReader 通知有新上行字节。只在 inFlight==0 && upAcked 时发,
 			// 否则违反 1-in-flight；下一次 recvCh 触发 send() 时 selectUpstream
 			// 也会取到这些字节,数据不会丢。
-			if !inFlight && upAcked {
+			if inFlight == 0 && upAcked {
 				if c.debug {
-					log.Printf("upNotify: triggering send (inFlight=false upAcked=true)")
+					log.Printf("upNotify: triggering send (inFlight=0 upAcked=true)")
 				}
 				send()
 			} else if c.debug {
-				log.Printf("upNotify: gated (inFlight=%v upAcked=%v) — will be picked up on next recv",
+				log.Printf("upNotify: gated (inFlight=%d upAcked=%v) — will be picked up on next recv",
 					inFlight, upAcked)
 			}
 
 		case <-time.After(timeout):
 			// 上一次发包后既没收到响应,也没有 upNotify 触发——要么响应丢了,
-			// 要么真的空闲（lazy 模式应该有 lazy hold 兜着,正常不会到这里）。
-			if !inFlight {
-				if c.debug {
-					log.Printf("timeout(%v): no inflight, idle send", timeout)
-				}
-				send()
-			} else {
-				// 怀疑响应丢失：重传同一帧而不是发新帧。
-				// 重传时不消耗新的 upSeq,服务端去重层会按 QNAME 命中缓存。
-				if !upAcked && lastUpData != nil {
-					if c.debug {
-						log.Printf("timeout(%v): response lost, retransmit sid=%d seq=%d len=%d",
-							timeout, lastUpSID, upSeq, len(lastUpData))
-					}
-					c.asyncSendStreamData(conn, lastUpSID, lastUpData, upSeq, downAck)
-				} else {
-					if c.debug {
-						log.Printf("timeout(%v): response lost, retransmit poll ack=%d", timeout, downAck)
-					}
-					c.asyncSendPoll(conn, downAck)
-				}
+			// 要么 server 异常没回（lazy hold 最多 1s,正常 2s 内必有响应）。
+			//
+			// 行为：
+			//   - inFlight==0：异常路径（不应到这里）,补一发。
+			//   - inFlight>0：发一个 retransmit；inFlight++（瞬态 2）。recv 拿到
+			//     第一个响应只 decrement、**不**触发新 send；第二个响应回来
+			//     inFlight 归 0,才走正常 send 链路。
+			//
+			// 关键：**这里 send() 增加 inFlight 后,recv 一侧的 gate 保证不会
+			// 滚雪球**。原来的 bug 是 recv 总是 send,不论 inFlight 多少 —— 那种
+			// 情况下 timeout 多发一次会永久卡在 2-in-flight,触发 server lazyHeld
+			// race 形成 30/秒 风暴。
+			if inFlight > 0 && c.debug {
+				log.Printf("timeout(%v): suspect response lost, retransmit (inFlight %d → %d)",
+					timeout, inFlight, inFlight+1)
+			} else if c.debug {
+				log.Printf("timeout(%v): no inflight, idle send", timeout)
 			}
+			send()
 		}
 	}
 }
@@ -665,7 +686,7 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 		if c.debug {
 			log.Printf("  Closed flag set: session ended by server, tearing down")
 		}
-		c.tunnelUp = false
+		c.tunnelUp.Store(false)
 		return
 	}
 
@@ -743,7 +764,7 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 // 看似稳定但偶现死锁。
 func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 	buf := make([]byte, 65536)
-	for c.tunnelUp {
+	for c.tunnelUp.Load() {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, err := conn.Read(buf)
 		if err != nil {
@@ -764,7 +785,7 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 			if c.debug {
 				log.Printf("DNS recv loop fatal: %v", err)
 			}
-			c.tunnelUp = false
+			c.tunnelUp.Store(false)
 			return
 		}
 		if n > 0 {
@@ -793,7 +814,7 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 					if c.debug {
 						log.Printf("DNS recv loop: fatal rcode %d, tearing down", msg.Rcode)
 					}
-					c.tunnelUp = false
+					c.tunnelUp.Store(false)
 					return
 				}
 				// 其它非 success rcode（如 NXDOMAIN）忽略,等下次响应。
