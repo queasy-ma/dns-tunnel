@@ -593,6 +593,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string) (*Session, error) {
 		// 环境下立刻打到 ~1000 poll/s。默认 true 彻底消除这条竞态。
 		lazyMode:  true,
 		useNULL:   false,
+		downSeq:   1,    // 从 1 开始,避免与客户端初始 ack=0 产生歧义（丢包时 0==0 误判为已确认）
 		downAcked: true, // 初始无未 ack 的下行,允许立即取新 chunk
 		streams:   make(map[uint8]*Stream),
 		dataReady: make(chan struct{}, 1),
