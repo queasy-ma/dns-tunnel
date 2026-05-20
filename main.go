@@ -73,6 +73,9 @@ func main() {
 	logToFile := flag.Bool("log", false, "Write log to <exe-dir>/YYYY-MM-DD.log (append mode)")
 	flag.Parse()
 
+	// 顶层先打开文件日志,这样后面的 "Starting DNS tunnel..." 几行也能落盘;
+	// 再传 false 给 NewDNS* 避免重复调用 EnableFileLog（其本身是 idempotent,
+	// 这里传 false 只是少一次锁开销,语义不影响）。
 	if *logToFile {
 		f, err := tunnel.EnableFileLog()
 		if err != nil {
@@ -90,7 +93,7 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		server := tunnel.NewDNSServer(*serverListen, *serverDest, *debug, tunnel.DefaultKey, *domain)
+		server := tunnel.NewDNSServer(*serverListen, *serverDest, *debug, tunnel.DefaultKey, *domain, false)
 		log.Printf("Starting DNS tunnel server:")
 		log.Printf("  DNS listening on: %s", *serverListen)
 		log.Printf("  Forwarding to: %s", *serverDest)
@@ -112,7 +115,7 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		client, err := tunnel.NewDNSClient(*clientListen, *clientDest, *debug, tunnel.DefaultKey, *domain)
+		client, err := tunnel.NewDNSClient(*clientListen, *clientDest, *debug, tunnel.DefaultKey, *domain, false)
 		if err != nil {
 			log.Fatalf("Failed to create DNS client: %v", err)
 		}

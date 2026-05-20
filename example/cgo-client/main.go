@@ -5,10 +5,10 @@
 //	int  StartDnsClient(const char* listenAddr, const char* dnsServerAddr,
 //	                    int debug, const char* key, const char* domain,
 //	                    int logToFile);
-//	     // 返回 0 成功 / -1 NewDNSClient 失败 / -2 已有 client 在跑 /
-//	     // -3 logToFile=1 但日志文件打开失败。Start 走后台 goroutine,
-//	     // 此调用本身**不阻塞**。logToFile=1 时把日志追加写入
-//	     // <宿主可执行文件目录>/<YYYY-MM-DD>.log; =0 时保持默认 stderr。
+//	     // 返回 0 成功 / -1 NewDNSClient 失败 / -2 已有 client 在跑。
+//	     // Start 走后台 goroutine,此调用本身**不阻塞**。
+//	     // logToFile=1 时把日志追加写入 <宿主可执行文件目录>/<YYYY-MM-DD>.log,
+//	     // =0 时保持默认 stderr。文件打开失败会 fallback 回 stderr,不影响启动。
 //	void StopDnsClient(void);
 //	     // 优雅关闭。多次调用安全（第二次起 no-op）。
 //	int  IsDnsClientRunning(void);
@@ -74,7 +74,6 @@ var (
 //	 0  成功
 //	-1  NewDNSClient 构造失败
 //	-2  已有客户端在跑（先 Stop 再 Start）
-//	-3  logToFile=1 但日志文件打开失败（路径不可写 / 权限不足等）
 //
 // 行为：本调用**不阻塞**,Start 在后台 goroutine 里跑。调用后可立即用
 // IsDnsClientRunning 查询。
@@ -83,13 +82,9 @@ var (
 func StartDnsClient(listenAddr *C.char, dnsServerAddr *C.char,
 	debug C.int, key *C.char, domain *C.char, logToFile C.int) C.int {
 
-	// 日志重定向放在构造 client 之前,这样 NewDNSClient 内部的日志也能落盘。
-	if logToFile != 0 {
-		if _, err := tunnel.EnableFileLog(); err != nil {
-			return -3
-		}
-	}
-
+	// logToFile 透传给 NewDNSClient,由它内部决定要不要打开文件。
+	// 失败时 NewDNSClient 会 fallback 到 stderr 并继续构造,所以这里没有 -3 错误码,
+	// 文件日志是 best-effort 而不是阻塞性需求。
 	keyStr := C.GoString(key)
 	if keyStr == "" {
 		keyStr = tunnel.DefaultKey
@@ -101,6 +96,7 @@ func StartDnsClient(listenAddr *C.char, dnsServerAddr *C.char,
 		debug != 0,
 		keyStr,
 		C.GoString(domain),
+		logToFile != 0,
 	)
 	if err != nil {
 		return -1

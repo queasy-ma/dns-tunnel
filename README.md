@@ -107,13 +107,14 @@ sudo ./dns-tunnel -server-listen 0.0.0.0:53 -server-dest 127.0.0.1:22 -domain t.
 
 | 类型/函数 | 说明 |
 |---|---|
-| `tunnel.NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain string)` | 创建客户端实例,`domain` 为空则直连模式 |
-| `tunnel.NewDNSServer(dnsListen, tcpDest string, debug bool, key string, domain string)` | 创建服务端实例 |
+| `tunnel.NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain string, logToFile bool)` | 创建客户端实例,`domain` 为空则直连模式;`logToFile=true` 把日志追加写入 `<exe目录>/<YYYY-MM-DD>.log` |
+| `tunnel.NewDNSServer(dnsListen, tcpDest string, debug bool, key string, domain string, logToFile bool)` | 创建服务端实例;`logToFile` 同 client 含义 |
 | `client.Start() error` | 启动客户端 (阻塞),开始监听 TCP 并通过 DNS 隧道转发 |
 | `client.Close()` | 优雅关闭客户端,断开所有连接 |
 | `client.IsRunning() bool` | 查询客户端是否正在运行 (线程安全) |
 | `server.Start() error` | 启动服务端 (阻塞),监听 DNS 请求并转发到目标 TCP |
 | `server.Close()` | 优雅关闭服务端 |
+| `tunnel.EnableFileLog() (*os.File, error)` | 手动把日志重定向到 `<exe目录>/<YYYY-MM-DD>.log`;多次调用 idempotent |
 | `tunnel.DefaultKey` | 内置的 Vigenere 混淆密钥,客户端和服务端必须一致 |
 
 ### 嵌入客户端
@@ -133,6 +134,7 @@ func main() {
         false,                 // debug
         tunnel.DefaultKey,     // 加密密钥
         "t.example.com",       // domain, 空串则直连
+        false,                 // logToFile: true 时把日志落到 <exe目录>/<YYYY-MM-DD>.log
     )
     if err != nil {
         log.Fatal(err)
@@ -162,6 +164,7 @@ server := tunnel.NewDNSServer(
     false,                 // debug
     tunnel.DefaultKey,     // 密钥, 须与客户端一致
     "t.example.com",       // domain
+    false,                 // logToFile
 )
 
 go func() {
@@ -182,17 +185,14 @@ server.Close()
 // main.go (package main, import "C")
 //export StartDnsClient
 func StartDnsClient(listenAddr *C.char, dnsServer *C.char, debug C.int, key *C.char, domain *C.char, logToFile C.int) C.int {
-    if logToFile != 0 {
-        if _, err := tunnel.EnableFileLog(); err != nil { return -3 }
-    }
-    client, err := tunnel.NewDNSClient(C.GoString(listenAddr), C.GoString(dnsServer), debug != 0, C.GoString(key), C.GoString(domain))
+    client, err := tunnel.NewDNSClient(C.GoString(listenAddr), C.GoString(dnsServer), debug != 0, C.GoString(key), C.GoString(domain), logToFile != 0)
     if err != nil { return -1 }
     go client.Start()
     return 0
 }
 ```
 
-`logToFile=1` 时把日志追加写到宿主可执行文件目录下的 `<YYYY-MM-DD>.log`,适合 host 进程的 stderr 被吞 / 重定向 / 重定向不到屏幕的场景（Windows 服务、systemd、被 GUI 程序加载等）。`logToFile=0` 时维持默认 stderr 输出。
+`logToFile=1` 时把日志追加写到宿主可执行文件目录下的 `<YYYY-MM-DD>.log`,适合 host 进程的 stderr 被吞 / 重定向 / 重定向不到屏幕的场景（Windows 服务、systemd、被 GUI 程序加载等）。`logToFile=0` 时维持默认 stderr 输出。文件打开失败会自动 fallback 回 stderr,不会让 NewDNS* 失败。
 
 ```bash
 CGO_ENABLED=1 go build -buildmode=c-archive -o libdnstunnel.a .

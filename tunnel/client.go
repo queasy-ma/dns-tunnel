@@ -113,7 +113,16 @@ type DNSClient struct {
 //
 // 初始默认：lazy + compression 开启、Base32 编码、TXT 记录。这些值在握手时
 // 可能被协商关 / 升级,但默认开启避免"还没握手成功 dataLoop 就先按错配置发包"。
-func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain string) (*DNSClient, error) {
+//
+// logToFile=true 时调用 EnableFileLog() 把日志重定向到
+// <可执行文件目录>/<YYYY-MM-DD>.log。失败只在 stderr 打一行警告,不影响构造
+// (文件日志失败时降级回 stderr 仍可用)。
+func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain string, logToFile bool) (*DNSClient, error) {
+	if logToFile {
+		if _, err := EnableFileLog(); err != nil {
+			log.Printf("NewDNSClient: EnableFileLog failed: %v (falling back to stderr)", err)
+		}
+	}
 	suffix := defaultTLD
 	if domain != "" {
 		suffix = domain

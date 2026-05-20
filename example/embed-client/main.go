@@ -22,7 +22,7 @@ func main() {
 	domain := "t.example.com" // empty string for direct mode
 	debug := true
 
-	client, err := tunnel.NewDNSClient(listenAddr, dnsServer, debug, tunnel.DefaultKey, domain)
+	client, err := tunnel.NewDNSClient(listenAddr, dnsServer, debug, tunnel.DefaultKey, domain, false)
 	if err != nil {
 		log.Fatalf("NewDNSClient: %v", err)
 	}

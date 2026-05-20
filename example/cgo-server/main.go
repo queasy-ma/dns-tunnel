@@ -5,9 +5,9 @@
 //	int  StartDnsServer(const char* dnsListen, const char* tcpDest,
 //	                    int debug, const char* key, const char* domain,
 //	                    int logToFile);
-//	     // 返回 0 成功 / -2 已有 server 在跑 / -3 logToFile=1 但日志文件打开失败。
-//	     // Start 走后台 goroutine,本调用不阻塞。logToFile=1 时把日志追加写到
-//	     // <宿主可执行文件目录>/<YYYY-MM-DD>.log; =0 时保持默认 stderr。
+//	     // 返回 0 成功 / -2 已有 server 在跑。Start 走后台 goroutine,本调用不阻塞。
+//	     // logToFile=1 时把日志追加写到 <宿主可执行文件目录>/<YYYY-MM-DD>.log,
+//	     // =0 时保持默认 stderr。文件打开失败会 fallback 回 stderr,不影响启动。
 //	void StopDnsServer(void);
 //	int  IsDnsServerRunning(void);
 //	     // 1 = 运行中,0 = 未启动 / 已停止 / 致命错误退出。
@@ -70,7 +70,6 @@ var (
 //
 //	 0  成功
 //	-2  已有 server 在跑（先 Stop 再 Start）
-//	-3  logToFile=1 但日志文件打开失败（路径不可写 / 权限不足等）
 //
 // 行为：不阻塞,Start 在后台 goroutine。
 //
@@ -78,24 +77,19 @@ var (
 func StartDnsServer(dnsListen *C.char, tcpDest *C.char,
 	debug C.int, key *C.char, domain *C.char, logToFile C.int) C.int {
 
-	// 日志重定向放在构造 server 之前,这样 NewDNSServer 内部的日志也能落盘。
-	if logToFile != 0 {
-		if _, err := tunnel.EnableFileLog(); err != nil {
-			return -3
-		}
-	}
-
 	keyStr := C.GoString(key)
 	if keyStr == "" {
 		keyStr = tunnel.DefaultKey
 	}
 
+	// logToFile 透传给 NewDNSServer,失败时 fallback 到 stderr。
 	server := tunnel.NewDNSServer(
 		C.GoString(dnsListen),
 		C.GoString(tcpDest),
 		debug != 0,
 		keyStr,
 		C.GoString(domain),
+		logToFile != 0,
 	)
 
 	serverMu.Lock()

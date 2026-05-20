@@ -438,7 +438,16 @@ type DNSServer struct {
 
 // NewDNSServer —— 构造服务端。
 // 解析 domain 的段数 + 父域,后续 handleDNSRequest 用 domainPartsCount 切 FQDN。
-func NewDNSServer(dnsListener, tcpDest string, debug bool, key string, domain string) *DNSServer {
+//
+// logToFile=true 时调用 EnableFileLog() 把日志重定向到
+// <可执行文件目录>/<YYYY-MM-DD>.log。失败只在 stderr 打一行警告,不影响构造
+// (服务端启动本身不依赖文件日志,失败时降级回 stderr 仍可用)。
+func NewDNSServer(dnsListener, tcpDest string, debug bool, key string, domain string, logToFile bool) *DNSServer {
+	if logToFile {
+		if _, err := EnableFileLog(); err != nil {
+			log.Printf("NewDNSServer: EnableFileLog failed: %v (falling back to stderr)", err)
+		}
+	}
 	domainParts := 1
 	parentDomain := domain
 	if domain != "" {

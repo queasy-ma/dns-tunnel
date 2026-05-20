@@ -21,7 +21,7 @@ func main() {
 	domain := "t.example.com" // empty string for direct mode
 	debug := true
 
-	server := tunnel.NewDNSServer(dnsListen, tcpDest, debug, tunnel.DefaultKey, domain)
+	server := tunnel.NewDNSServer(dnsListen, tcpDest, debug, tunnel.DefaultKey, domain, false)
 
 	// Start in background goroutine (Start() blocks)
 	errCh := make(chan error, 1)
