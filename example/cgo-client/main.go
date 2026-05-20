@@ -3,9 +3,12 @@
 // 公开 C ABI:
 //
 //	int  StartDnsClient(const char* listenAddr, const char* dnsServerAddr,
-//	                    int debug, const char* key, const char* domain);
-//	     // 返回 0 成功 / -1 NewDNSClient 失败。Start 走后台 goroutine,
-//	     // 此调用本身**不阻塞**。
+//	                    int debug, const char* key, const char* domain,
+//	                    int logToFile);
+//	     // 返回 0 成功 / -1 NewDNSClient 失败 / -2 已有 client 在跑 /
+//	     // -3 logToFile=1 但日志文件打开失败。Start 走后台 goroutine,
+//	     // 此调用本身**不阻塞**。logToFile=1 时把日志追加写入
+//	     // <宿主可执行文件目录>/<YYYY-MM-DD>.log; =0 时保持默认 stderr。
 //	void StopDnsClient(void);
 //	     // 优雅关闭。多次调用安全（第二次起 no-op）。
 //	int  IsDnsClientRunning(void);
@@ -63,19 +66,29 @@ var (
 //	debug          非零启用 debug 日志（与 server 同等粒度,会打每个 DNS 查询）。
 //	key            Vigenère 密钥;传 NULL / "" 使用 tunnel.DefaultKey。
 //	domain         NS 委派域,例 "t.example.com";空表示直连模式。
+//	logToFile      非零时把日志追加写到 <宿主可执行文件目录>/<YYYY-MM-DD>.log,
+//	               =0 时保持默认 stderr。多次调用 idempotent（沿用首次打开的文件）。
 //
 // 返回:
 //
 //	 0  成功
 //	-1  NewDNSClient 构造失败
 //	-2  已有客户端在跑（先 Stop 再 Start）
+//	-3  logToFile=1 但日志文件打开失败（路径不可写 / 权限不足等）
 //
 // 行为：本调用**不阻塞**,Start 在后台 goroutine 里跑。调用后可立即用
 // IsDnsClientRunning 查询。
 //
 //export StartDnsClient
 func StartDnsClient(listenAddr *C.char, dnsServerAddr *C.char,
-	debug C.int, key *C.char, domain *C.char) C.int {
+	debug C.int, key *C.char, domain *C.char, logToFile C.int) C.int {
+
+	// 日志重定向放在构造 client 之前,这样 NewDNSClient 内部的日志也能落盘。
+	if logToFile != 0 {
+		if _, err := tunnel.EnableFileLog(); err != nil {
+			return -3
+		}
+	}
 
 	keyStr := C.GoString(key)
 	if keyStr == "" {

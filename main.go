@@ -38,6 +38,7 @@ Client Mode Options:
 Common Options:
   -domain string          Domain for NS delegation mode (e.g., "t.example.com")
   -debug                  Enable debug logging
+  -log                    Write log to <exe-dir>/YYYY-MM-DD.log (append mode)
   -h                      Show this help message
 
 Examples:
@@ -69,7 +70,17 @@ func main() {
 	// -domain 同时影响两端：客户端把 FQDN 尾巴换成它；服务端用它判断 NS 委派下的标准查询。
 	domain := flag.String("domain", "", "(e.g., t.example.com) Domain for NS delegation mode")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	logToFile := flag.Bool("log", false, "Write log to <exe-dir>/YYYY-MM-DD.log (append mode)")
 	flag.Parse()
+
+	if *logToFile {
+		f, err := tunnel.EnableFileLog()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to enable file log: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Logging to %s\n", f.Name())
+	}
 
 	// 任一 server flag 出现就进入服务端模式。两个必须同时出现,否则报错退出。
 	if *serverListen != "" || *serverDest != "" {

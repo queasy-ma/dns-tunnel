@@ -91,8 +91,11 @@ sudo ./dns-tunnel -server-listen 0.0.0.0:53 -server-dest 127.0.0.1:22 -domain t.
 | `-client-dest` | client 要走的 DNS 服务器,如 `192.168.1.1:53` |
 | `-domain` | NS 委派模式的子域,如 `t.example.com`;不传则用 `edu` 占位走直连 |
 | `-debug` | 打印协议级日志 |
+| `-log` | 把日志追加写到 `<可执行文件目录>/<YYYY-MM-DD>.log`（不指定路径,文件名为启动当日日期） |
 
 `-server-*` 与 `-client-*` 二选一,各自的两个参数必须成对出现。
+
+日志默认输出到 stderr,时间戳精度为微秒(便于和 server 端 tcpdump 对齐)。加 `-log` 后切换为文件追加写,跨午夜不滚动 —— 文件名固定为启动当日日期。
 
 ---
 
@@ -178,13 +181,18 @@ server.Close()
 ```go
 // main.go (package main, import "C")
 //export StartDnsClient
-func StartDnsClient(listenAddr *C.char, dnsServer *C.char, debug C.int, key *C.char, domain *C.char) C.int {
+func StartDnsClient(listenAddr *C.char, dnsServer *C.char, debug C.int, key *C.char, domain *C.char, logToFile C.int) C.int {
+    if logToFile != 0 {
+        if _, err := tunnel.EnableFileLog(); err != nil { return -3 }
+    }
     client, err := tunnel.NewDNSClient(C.GoString(listenAddr), C.GoString(dnsServer), debug != 0, C.GoString(key), C.GoString(domain))
     if err != nil { return -1 }
     go client.Start()
     return 0
 }
 ```
+
+`logToFile=1` 时把日志追加写到宿主可执行文件目录下的 `<YYYY-MM-DD>.log`,适合 host 进程的 stderr 被吞 / 重定向 / 重定向不到屏幕的场景（Windows 服务、systemd、被 GUI 程序加载等）。`logToFile=0` 时维持默认 stderr 输出。
 
 ```bash
 CGO_ENABLED=1 go build -buildmode=c-archive -o libdnstunnel.a .

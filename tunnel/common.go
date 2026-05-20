@@ -17,11 +17,61 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
+
+// 把标准 log 的时间戳精度提到微秒,方便和 server 端 tcpdump（默认微秒）以及
+// 客户端 / 服务端两侧之间做时间对齐。秒级精度看不到一秒内多条 poll 的顺序,
+// 调 storm 类 bug 时基本没法用。Embedders 想自定义可以在 NewDNS* 之后再覆写。
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+}
+
+// logFileMu 防并发重入 EnableFileLog 时把 log 输出反复切换 / 文件句柄泄漏。
+// 重复调用是 no-op：发现 currentLogFile 非 nil 直接返回它本身。
+var (
+	logFileMu      sync.Mutex
+	currentLogFile *os.File
+)
+
+// EnableFileLog 把标准 log 包的输出重定向到 <可执行文件所在目录>/<YYYY-MM-DD>.log,
+// 追加打开;返回打开的文件句柄。多次调用安全（第二次起返回已经打开的句柄,不再切换输出）。
+//
+// 设计取舍:
+//   - 路径用 os.Executable() 的目录,不用 CWD —— CGO 共享库 / Windows 服务 / systemd
+//     之类的场景 CWD 经常是 /(或 C:\Windows\System32),不可写也不直观;
+//     "程序目录" 对 CLI 二进制和 c-archive (静态链入业务程序) 都对得上。
+//   - 文件名只取启动时的日期,**不滚动**。跨午夜继续写同一个文件;真要按天分割
+//     请重启进程或外接 logrotate。
+//   - 不与 stderr 复用(不用 io.MultiWriter): 用户传 -log / logToFile=true 的语义
+//     通常是 "host 进程的 stderr 不能用,需要落盘",MultiWriter 反而会污染 host stderr。
+//     需要两路输出的场景请在外面包 tee。
+func EnableFileLog() (*os.File, error) {
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
+	if currentLogFile != nil {
+		return currentLogFile, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("os.Executable: %w", err)
+	}
+	dir := filepath.Dir(exe)
+	name := filepath.Join(dir, time.Now().Format("2006-01-02")+".log")
+	f, err := os.OpenFile(name, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open log file %s: %w", name, err)
+	}
+	log.SetOutput(f)
+	currentLogFile = f
+	return f, nil
+}
 
 // 协议级常量。改这些值之前请先看 DESIGN.md §12，里面记录了为什么取这些数字。
 const (
