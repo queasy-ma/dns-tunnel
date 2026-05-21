@@ -580,6 +580,13 @@ func (c *DNSClient) dataLoop() {
 	// 等第二个响应回来 inFlight 回 0,才发下一个。
 	inFlight := 0
 
+	// lazy 降级跟踪（参考 iodine client.c send_query）：
+	// windowSent/windowRecv 统计 dataLoop 启动后的发送/接收量。
+	// 如果 windowSent > 6 且 windowRecv == 0，说明解析器吃掉了所有 lazy 响应，
+	// 主动关闭 lazy 模式并通知服务端。
+	windowSent := 0
+	windowRecv := 0
+
 	// send —— 发一个查询。优先重传未 ack 的旧帧,否则从 selectUpstream 取新数据,
 	// 都没有的话发 poll。**调用方负责确认 inFlight==0 (或在 timeout 重传场景下接受瞬态 >1)**。
 	send := func() {
@@ -606,6 +613,7 @@ func (c *DNSClient) dataLoop() {
 				c.asyncSendPoll(conn, downAck)
 			}
 		}
+		windowSent++
 		inFlight++
 	}
 
@@ -621,6 +629,7 @@ func (c *DNSClient) dataLoop() {
 
 		select {
 		case raw := <-recvCh:
+			windowRecv++
 			if inFlight > 0 {
 				inFlight--
 			}
@@ -681,19 +690,20 @@ func (c *DNSClient) dataLoop() {
 			}
 
 		case <-time.After(timeout):
-			// 上一次发包后既没收到响应,也没有 upNotify 触发——要么响应丢了,
-			// 要么 server 异常没回（lazy hold 最多 1s,正常 2s 内必有响应）。
-			//
-			// 行为：
-			//   - inFlight==0：异常路径（不应到这里）,补一发。
-			//   - inFlight>0：发一个 retransmit；inFlight++（瞬态 2）。recv 拿到
-			//     第一个响应只 decrement、**不**触发新 send；第二个响应回来
-			//     inFlight 归 0,才走正常 send 链路。
-			//
-			// 关键：**这里 send() 增加 inFlight 后,recv 一侧的 gate 保证不会
-			// 滚雪球**。原来的 bug 是 recv 总是 send,不论 inFlight 多少 —— 那种
-			// 情况下 timeout 多发一次会永久卡在 2-in-flight,触发 server lazyHeld
-			// race 形成 30/秒 风暴。
+			// lazy 降级检测（参考 iodine）：发了 >6 个查询却收不到任何响应，
+			// 说明解析器不转发 lazy 延迟响应。关闭 lazy 让服务端立即回包。
+			if c.lazyMode && windowSent > 6 && windowRecv == 0 {
+				c.lazyMode = false
+				if c.debug {
+					log.Printf("lazy degradation: %d sent / %d recv, disabling lazy mode", windowSent, windowRecv)
+				}
+				go func() {
+					meta := CtrlMeta(cmdLazy, 0)
+					fqdn := buildFQDN("L", meta, c.sessionID, c.tld)
+					c.sendDNSRetries(fqdn, 2)
+				}()
+			}
+
 			if inFlight > 0 && c.debug {
 				log.Printf("timeout(%v): suspect response lost, retransmit (inFlight %d → %d)",
 					timeout, inFlight, inFlight+1)
