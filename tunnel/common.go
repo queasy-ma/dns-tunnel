@@ -98,8 +98,15 @@ const (
 	maxDownPayloadTXT  = 200 // TXT 模式下行 payload 默认上限（握手后可被探测改大）。
 	maxDownPayloadNULL = 500 // NULL 模式下行 payload 默认上限。
 
-	// DefaultKey 是 Vigenère 默认密钥。仅用于反 IDS 关键字匹配,不提供
-	// 机密性保障。要真正加密请换 AEAD（AES-GCM / ChaCha20-Poly1305）+ KDF。
+	// dnsRespOverhead 是 DNS 响应中除 "QNAME 字符数 + rdata 字节" 之外的固定开销估值,
+	// 用于 cmdRespSize 探测把 (qnameLen, rdataLen) 折算成 "总响应字节"。
+	// 拆解：DNS header 12 + QNAME 包头/null/QTYPE/QCLASS 共 ~6 + RR header ~12
+	//      （含 name compression 指针 2B）+ EDNS OPT ~11 + 余量 ~9 = ~50。
+	// 略大于实测值即可，保留余量比贴线探测安全（链路上的 MTU / EDNS 阈值往往有抖动）。
+	dnsRespOverhead = 50
+
+	// DefaultKey 是 Vigenère 默认密钥。仅用于字节扰动（降低字节特征与已知协议头
+	// 的相关性）,不提供机密性保障。要真正加密请换 AEAD（AES-GCM / ChaCha20-Poly1305）+ KDF。
 	DefaultKey = "!QAZ@WSX#EDC$RFV%TGB^YHN"
 
 	EncBase32 = 0 // 默认编码：6 段大小写不敏感,扛 0x20 随机化。
@@ -193,8 +200,14 @@ func generateSessionID() string {
 //   - Base32：8 字符表示 5 字节,即明文字节 = 字符数 × 5/8。
 //   - Base64：4 字符表示 3 字节,即明文字节 = 字符数 × 3/4。
 func maxUpPayload(tld string, enc int) int {
+	return maxUpPayloadWithBudget(tld, enc, maxDNSNameLen)
+}
+
+// maxUpPayloadWithBudget 同 maxUpPayload，但用调用方给的 QNAME 字符预算
+// （而不是常量 maxDNSNameLen）。客户端探测出运行时实际可用 QNAME 长度后用这个。
+func maxUpPayloadWithBudget(tld string, enc int, nameBudget int) int {
 	overhead := cmcLength + 1 + metaLength + 1 + sessionIDLength + 1 + len(tld) + 1 + 2
-	avail := maxDNSNameLen - overhead
+	avail := nameBudget - overhead
 	if avail < 0 {
 		return 0
 	}
@@ -207,9 +220,55 @@ func maxUpPayload(tld string, enc int) int {
 	}
 }
 
+// makeFixedLengthLabels 构造一段总字符长度恰好为 charLen 的 DNS-safe 字符串，
+// 按 maxLabelSize (63) 切分用 "." 连接。用于 QNAME 长度探测——服务端不解 dataStr，
+// 我们只关心 QNAME 总长。
+//
+// **填充字符使用 base64url 字母表**（含 `_`、`-`、数字、混合大小写）：必须和真实
+// 数据帧的字符集一致，否则探测会**假阳性**——某些递归链对长 QNAME 含 `_` / `-` 的
+// 才会触发过滤，全 'A' 字符的探测包反而过得了，导致探测出的上限比实际能用的大。
+//
+// label 第一个字符强制不取 `-`（开头是 `-` 违反 RFC 952 hostname 规约，部分递归会
+// 直接拒绝）；base64url 字母表里 `-` 排在最末位（index 63）所以从 offset=1 开始
+// 取就能保证 label[0] 总是字母。
+//
+// 算法保证：strings.Join 之后的字符串长度 == charLen，且每个 label 都 1..63 长。
+func makeFixedLengthLabels(charLen int) string {
+	if charLen <= 0 {
+		return ""
+	}
+	// 64-char base64url-style alphabet; index 62='_', 63='-'.
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+	fill := func(n int) string {
+		b := make([]byte, n)
+		for i := 0; i < n; i++ {
+			// offset+1 让 label[0]='B'（避开 '-' / '_' 开头）。
+			b[i] = alphabet[(i+1)%64]
+		}
+		return string(b)
+	}
+	if charLen <= maxLabelSize {
+		return fill(charLen)
+	}
+	var parts []string
+	chars := charLen
+	for chars > maxLabelSize {
+		parts = append(parts, fill(maxLabelSize))
+		chars -= maxLabelSize + 1
+	}
+	if chars == 0 {
+		last := parts[len(parts)-1]
+		parts[len(parts)-1] = last[:len(last)-1]
+		parts = append(parts, fill(1))
+	} else if chars > 0 {
+		parts = append(parts, fill(chars))
+	}
+	return strings.Join(parts, ".")
+}
+
 // vigenereEncrypt 用 key 做按字节加法混淆。
 //
-// 作用范围：让明文上下行字节不再是连续 ASCII / 已知协议头,反 IDS 模式匹配
+// 作用范围：让明文上下行字节不再是连续 ASCII / 已知协议头,降低字节特征
 // 比"裸 base32 + 控制字符"强一些。**不要**把这当机密性保障：
 //   - 长度泄露：密文长度 == 明文长度；
 //   - 无认证：攻击者翻转任意 bit 不会被检测；
@@ -313,6 +372,22 @@ func generateFragSizeProbe(size int) []byte {
 		data[i] = byte(i & 0xFF)
 	}
 	return data
+}
+
+// generateNULLFragSizeProbe 造一段 size 字节的随机探测数据并用 key 做 Vigenère 加密。
+//
+// NULL 记录直接承载原始字节，固定递增内容（0x00, 0x01, ...）在链路上特征明显；
+// 用随机字节 + 加密让探测包和正常数据包在字节分布上无法区分。
+// 客户端只校验回包长度 ≥ size，加密不影响判断。
+func generateNULLFragSizeProbe(size int, key string) []byte {
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		// crypto/rand 失败极罕见；退化为递增字节保证探测能继续。
+		for i := range data {
+			data[i] = byte(i & 0xFF)
+		}
+	}
+	return vigenereEncrypt(data, key)
 }
 
 // buildFQDN 用 "." 把 parts 串成 FQDN。单独抽出来仅为了语义清晰。

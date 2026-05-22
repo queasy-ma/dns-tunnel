@@ -1,6 +1,8 @@
 # dns-tunnel
 
-把任意 TCP 流量封进 DNS 查询 / 应答的隧道。典型场景:**只能解析 DNS 的网络环境**里跑 SSH、SCP、HTTP 代理等,只依赖 [`miekg/dns`](https://github.com/miekg/dns)。
+把任意 TCP 流量封进 DNS 查询 / 应答的隧道，适用于网络环境复杂、仅 DNS 协议可达的合法授权场景（如自有基础设施上的 SSH、SCP、HTTP 代理等），只依赖 [`miekg/dns`](https://github.com/miekg/dns)。
+
+> **使用声明**：本工具仅适用于使用者对两端网络基础设施均具有合法授权的场景，包括自有服务器、经网络管理员授权的内部网络、以及授权的网络测试与研究环境。在未经授权的网络环境中使用可能违反当地法律法规；使用者须自行承担相应法律责任，作者不对任何未经授权的使用行为承担责任。
 
 ---
 
@@ -13,7 +15,7 @@
 - **Fragsize 探测**:二分握手得到链路实际能承载的下行最大长度
 - **lazy hold**:服务端把空 poll 挂住最多 1s 再回,空闲期发包频率 ~1Hz
 - **zlib 压缩**(payload > 16 字节时启用)
-- **Vigenère 反 IDS 关键字扰动**(混淆而非加密,详见 DESIGN.md §4.2)
+- **Vigenère 字节扰动**(降低字节特征，非加密，详见 DESIGN.md §4.2)
 - **两种部署模式**:直连(`-client-dest` 指向 server IP)/ NS 委派(`-domain` 子域走递归解析)
 
 ---
@@ -62,7 +64,7 @@ ssh user@127.0.0.1 -p 2222
 
 ## NS 委派模式
 
-如果隧道客户端只能解析受限网络里的 DNS,可以通过权威 NS 委派把子域 `t.example.com` 指向你控制的 `dns-tunnel` server,这样查询经由递归 DNS 转发抵达。需要在你的CND配置NS委派：
+如果隧道客户端处于仅 DNS 协议可达的合法授权网络环境（如自有内网或经管理员授权的场景），可以通过权威 NS 委派把子域 `t.example.com` 指向你控制的 `dns-tunnel` server，这样查询经由递归 DNS 转发抵达。需要在你的CND配置NS委派：
 
 ```
 t   IN  NS    ns1.example.com.

@@ -28,7 +28,12 @@ import (
 const (
 	// protoVersion 是 cmdVersion 握手时双方互验的协议版本号。
 	// 任何线格式变更（meta 长度、DownPkt 头、新命令）都应递增这个值。
-	protoVersion = 1
+	// v2: 新增 cmdQNameProbe (0x09) 用于上行 QNAME 长度自动探测。
+	// v3: 新增 cmdContentProbe (0x0A) 用于上行字符集逐字节诊断（仿 iodine pat64u 套路）。
+	// v4: 新增 cmdRespSize (0x0B) 用于"长 QNAME + 大 rdata"二维总响应预算探测，
+	//     解决"单维度都过 / 二维组合时静默丢包"的盲区。
+	// v5: NULL 记录探测数据改为随机字节 + Vigenère 加密，消除固定递增字节模式。
+	protoVersion = 5
 
 	// seqControl 是上行 meta 第 1 字节 == 0xFF 的"控制帧"标记。
 	// 客户端发任何控制命令时 seq 都填这个,数据帧 seq 走 0..254。
@@ -36,15 +41,18 @@ const (
 
 	// 控制命令字（meta 第 2 字节）。新增命令必须同步加 client 发送函数 +
 	// server handleControl 的 case。
-	cmdPoll        = uint8(0x00) // 空查询,捎带 ack,等下行
-	cmdVersion     = uint8(0x01) // 版本协商（握手第 1 步）
-	cmdFragSize    = uint8(0x02) // 下行 fragsize 探测 / commit（参数区分）
-	cmdLazy        = uint8(0x03) // 启 / 关 lazy hold
-	cmdCompress    = uint8(0x04) // 启 / 关 zlib 压缩
-	cmdRecType     = uint8(0x05) // NULL 记录探测 / Base64 编码探测
-	cmdClose       = uint8(0x06) // 关整个 session
-	cmdOpenStream  = uint8(0x07) // 新建 stream（参数 = streamID）
-	cmdCloseStream = uint8(0x08) // 关 stream
+	cmdPoll         = uint8(0x00) // 空查询,捎带 ack,等下行
+	cmdVersion      = uint8(0x01) // 版本协商（握手第 1 步）
+	cmdFragSize     = uint8(0x02) // 下行 fragsize 探测 / commit（参数区分）
+	cmdLazy         = uint8(0x03) // 启 / 关 lazy hold
+	cmdCompress     = uint8(0x04) // 启 / 关 zlib 压缩
+	cmdRecType      = uint8(0x05) // NULL 记录探测 / Base64 编码探测
+	cmdClose        = uint8(0x06) // 关整个 session
+	cmdOpenStream   = uint8(0x07) // 新建 stream（参数 = streamID）
+	cmdCloseStream  = uint8(0x08) // 关 stream
+	cmdQNameProbe   = uint8(0x09) // 上行 QNAME 长度自动探测：服务端回 "OK",不解 dataStr
+	cmdContentProbe = uint8(0x0A) // 上行内容字符集探测：服务端把 dataStr 原样 echo 回去（仿 iodine 'Z' 命令）
+	cmdRespSize     = uint8(0x0B) // "长 QNAME + 大 rdata"组合下的总响应预算探测/提交（参数区分 0=probe / 1=commit）
 
 	// DownPkt Flags 字段的位定义。
 	flagLastFrag     = uint8(0x80) // 本片是最后一片（本实现恒为 1）

@@ -124,6 +124,10 @@ type Session struct {
 	useNULL     bool
 	maxFrag     int
 	encoding    int
+	// respTotalBudget 是 cmdRespSize commit 来的"DNS 总响应字节预算"。0 = 未探测,
+	// 走静态 maxFrag。>0 时按当前 q.Name 长度动态收紧 chunk 上限,避免"长 QNAME
+	// + 大 rdata"组合超过递归路径的 UDP / EDNS 阈值被静默丢包。
+	respTotalBudget int
 
 	// L1 dnsCache ring：精确 / CI 命中 → 直接回放上次的 RDATA。
 	dnsCache     [dnsCacheSize]dnsCacheEntry
@@ -277,6 +281,34 @@ func (s *Session) getAnyDownChunk(maxSize int) (uint8, []byte) {
 		return sid, chunk
 	}
 	return 0, nil
+}
+
+// chunkLimitForQName —— 在 session.maxFrag 基础上,按 session.respTotalBudget
+// 和当前查询的 QNAME 长度收紧每次 chunk 的上限。
+//
+// respTotalBudget==0（客户端未探测或未提交）时直接返回 maxFrag,行为退化为旧版。
+// 否则按 "总响应预算 - QNAME字符数 - DNS固定开销 - DownPkt 头" 算出 rdata 能腾出
+// 给 payload 的字节数,与 maxFrag 取 min。
+//
+// **必须**持有 session.mu（读 respTotalBudget / maxFrag）。
+func (s *Session) chunkLimitForQName(qname string) int {
+	base := s.maxFrag
+	if s.respTotalBudget <= 0 {
+		return base
+	}
+	qnameLen := len(qname)
+	if qnameLen > 0 && qname[qnameLen-1] == '.' {
+		qnameLen-- // miekg/dns 的 q.Name 带 trailing dot,字符预算按"不含点"算
+	}
+	perRdata := s.respTotalBudget - qnameLen - dnsRespOverhead
+	perChunk := perRdata - downPktHeaderSize
+	if perChunk <= 0 {
+		return base
+	}
+	if perChunk < base {
+		return perChunk
+	}
+	return base
 }
 
 // getClosedStreamToNotify —— 选一个"已关闭但还没通知 client + downBuf 已空"的 stream 来发 StreamClosed。
@@ -794,6 +826,16 @@ func (s *DNSServer) sendAndCacheTXT(w dns.ResponseWriter, msg *dns.Msg, q dns.Qu
 func (s *DNSServer) handleControl(w dns.ResponseWriter, msg *dns.Msg, q dns.Question, session *Session, meta UpMeta, dataStr string) {
 	switch meta.Command {
 	case cmdVersion:
+		if meta.Param != protoVersion {
+			if s.debug {
+				log.Printf("  version mismatch: client=%d server=%d, rejecting", meta.Param, protoVersion)
+			}
+			session.mu.Lock()
+			session.closed = true
+			session.mu.Unlock()
+			s.sendResponse(w, msg, q, session, fmt.Sprintf("VERR,%d", protoVersion))
+			return
+		}
 		resp := fmt.Sprintf("V,%d,%s", protoVersion, formatSize(maxDownPayloadTXT))
 		s.sendResponse(w, msg, q, session, resp)
 
@@ -817,11 +859,10 @@ func (s *DNSServer) handleControl(w dns.ResponseWriter, msg *dns.Msg, q dns.Ques
 			}
 			return
 		}
-		probe := generateFragSizeProbe(size)
 		if q.Qtype == dns.TypeNULL {
-			s.sendAndCacheNULL(w, msg, q, session, probe)
+			s.sendAndCacheNULL(w, msg, q, session, generateNULLFragSizeProbe(size, s.key))
 		} else {
-			s.sendAndCacheTXT(w, msg, q, session, encodeDNSSafe(probe, EncBase32))
+			s.sendAndCacheTXT(w, msg, q, session, encodeDNSSafe(generateFragSizeProbe(size), EncBase32))
 		}
 
 	case cmdLazy:
@@ -919,6 +960,49 @@ func (s *DNSServer) handleControl(w dns.ResponseWriter, msg *dns.Msg, q dns.Ques
 		s.sendResponse(w, msg, q, session, "OK")
 		if s.debug {
 			log.Printf("  closed stream %d", streamID)
+		}
+
+	case cmdQNameProbe:
+		s.sendResponse(w, msg, q, session, "OK")
+		if s.debug {
+			log.Printf("  qname probe ack (qname char len=%d)", len(q.Name)-1)
+		}
+
+	case cmdContentProbe:
+		// 原样 echo dataStr 回客户端,客户端逐字节比对发现"哪个字符在路上被改了"。
+		// 注意：dataStr 是从 QNAME 解出来的,递归如果做了 0x20 case 随机化、字符替换、
+		// 或者把整段截短,这里 echo 出去的就是被改过的版本。客户端用这个做诊断。
+		s.sendResponse(w, msg, q, session, dataStr)
+		if s.debug {
+			log.Printf("  content probe ack (data char len=%d)", len(dataStr))
+		}
+
+	case cmdRespSize:
+		// dataStr 形如 "<sizeHex>[.<padding>...]"——padding 只是为了把 QNAME 撑到
+		// 实测长度,服务端只取首段 4 个 hex。
+		head := dataStr
+		if dot := strings.Index(head, "."); dot >= 0 {
+			head = head[:dot]
+		}
+		size, err := parseSize(head)
+		if err != nil || size <= 0 || size > 2000 {
+			s.sendResponse(w, msg, q, session, "ERR")
+			return
+		}
+		if meta.Param == 1 {
+			session.mu.Lock()
+			session.respTotalBudget = size
+			session.mu.Unlock()
+			s.sendResponse(w, msg, q, session, "OK")
+			if s.debug {
+				log.Printf("  commit respTotalBudget = %d", size)
+			}
+			return
+		}
+		if q.Qtype == dns.TypeNULL {
+			s.sendAndCacheNULL(w, msg, q, session, generateNULLFragSizeProbe(size, s.key))
+		} else {
+			s.sendAndCacheTXT(w, msg, q, session, encodeDNSSafe(generateFragSizeProbe(size), EncBase32))
 		}
 
 	default:
@@ -1032,7 +1116,7 @@ func (s *DNSServer) handlePollWithAck(w dns.ResponseWriter, msg *dns.Msg, q dns.
 	}
 
 	// 尝试取新数据
-	maxFrag := session.maxFrag
+	maxFrag := session.chunkLimitForQName(q.Name)
 	sid, chunk := session.getAnyDownChunk(maxFrag)
 
 	if chunk != nil {
@@ -1116,8 +1200,9 @@ func (s *DNSServer) fulfillPending(session *Session) {
 		return
 	}
 
-	// 尝试取数据
-	sid, chunk := session.getAnyDownChunk(session.maxFrag)
+	// 尝试取数据。chunk 上限按当前 pending 查询的 QNAME 长度动态收紧
+	// （long-QNAME + 大 rdata 组合是 v4 探测发现的盲区,见 protocol.go 注释）。
+	sid, chunk := session.getAnyDownChunk(session.chunkLimitForQName(p.q.Name))
 	if chunk == nil {
 		// 没有数据块，检查是否有关闭的 stream 需要通知
 		closedSID := session.getClosedStreamToNotify()

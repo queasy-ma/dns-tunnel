@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,6 +79,8 @@ type DNSClient struct {
 	maxFrag     int // 下行单包 payload 上限（影响服务端切片）
 	encoding    int // EncBase32 / EncBase64,影响 upPayload
 	upPayload   int // 上行单包能塞的明文字节上限
+	qnameBudget int // probeMaxQName 探测出的 QNAME 字符总长上限,0 = 未探或失败
+	respTotal   int // probeRespTotal 探测出的总响应字节预算,0 = 未探或失败
 
 	// 受 mu 保护：
 	mu          sync.Mutex
@@ -1047,14 +1050,25 @@ func (c *DNSClient) handshake() error {
 	if c.debug {
 		log.Printf("Version response: %q", string(resp))
 	}
-	// 服务端返回 "V,<ver>,<maxfraghex>"；解第 3 段作为初始 maxFrag。
-	if resp != nil && len(resp) > 0 && resp[0] == 'V' {
-		parts := strings.Split(string(resp), ",")
-		if len(parts) >= 3 {
-			if size, e := parseSize(parts[2]); e == nil && size > 0 {
-				c.maxFrag = size
-			}
-		}
+	// 服务端正常返回 "V,<ver>,<maxFragHex>"；版本不匹配返回 "VERR,<server_ver>"。
+	// 这两种格式之外的任何回包（含 nil / 空 / 前缀错）都视作非法,握手失败。
+	respStr := string(resp)
+	if strings.HasPrefix(respStr, "VERR,") {
+		return fmt.Errorf("server rejected protocol version: client=%d, server=%s", protoVersion, strings.TrimPrefix(respStr, "VERR,"))
+	}
+	parts := strings.Split(respStr, ",")
+	if len(parts) < 3 || parts[0] != "V" {
+		return fmt.Errorf("malformed version response: %q", respStr)
+	}
+	serverVer, e := strconv.Atoi(parts[1])
+	if e != nil {
+		return fmt.Errorf("bad server version field %q: %v", parts[1], e)
+	}
+	if serverVer != protoVersion {
+		return fmt.Errorf("protocol version mismatch: client=%d server=%d", protoVersion, serverVer)
+	}
+	if size, e := parseSize(parts[2]); e == nil && size > 0 {
+		c.maxFrag = size
 	}
 
 	if c.testNULLRecord() {
@@ -1077,6 +1091,29 @@ func (c *DNSClient) handshake() error {
 		log.Printf("Base64url not supported, using Base32")
 	}
 
+	c.runContentCoverage()
+
+	budget := c.probeMaxQName()
+	c.qnameBudget = budget
+	if budget > 0 && budget < maxDNSNameLen {
+		newUp := maxUpPayloadWithBudget(c.tld, c.encoding, budget)
+		if newUp > 0 && newUp < c.upPayload {
+			if c.debug {
+				log.Printf("QName budget probed: %d chars (was %d), upstream payload %d → %d",
+					budget, maxDNSNameLen, c.upPayload, newUp)
+			}
+			c.upPayload = newUp
+		} else if c.debug {
+			log.Printf("QName budget probed: %d chars, keeping upstream payload %d", budget, c.upPayload)
+		}
+	} else if c.debug {
+		if budget == 0 {
+			log.Printf("QName probe failed, keeping upstream payload %d", c.upPayload)
+		} else {
+			log.Printf("QName budget probed at max (%d), no shrink needed", budget)
+		}
+	}
+
 	probed := c.probeFragSize()
 	if probed > 0 {
 		// commit 用的 maxFrag 要扣掉 downPktHeaderSize（5 字节）。
@@ -1090,6 +1127,25 @@ func (c *DNSClient) handshake() error {
 		// commit 失败不致命,服务端按默认 maxFrag 切片,只是吞吐少一点。
 		if err := c.commitFragSize(probed); err != nil && c.debug {
 			log.Printf("Fragsize commit failed: %v (server will use default maxfrag)", err)
+		}
+	}
+
+	// 探测"长 QNAME + 大 rdata"组合下的总响应预算。fragsize 单维度过得了 1198 字节、
+	// QName 单维度过得了 228 字符,但二维同时撞上时部分递归会静默丢响应——是 POST
+	// 失败的根因（log-0521 实测）。返回 0 = 单维度即足够,无需在服务端额外收紧。
+	if budget > 0 {
+		respTotal := c.probeRespTotal(budget)
+		if respTotal > 0 {
+			c.respTotal = respTotal
+			if c.debug {
+				log.Printf("Response total budget probed: %d bytes (qname=%d) → server will clamp per-query chunk",
+					respTotal, budget)
+			}
+			if err := c.commitRespTotal(respTotal); err != nil && c.debug {
+				log.Printf("respTotal commit failed: %v (server will use static maxFrag only)", err)
+			}
+		} else if c.debug {
+			log.Printf("Response total budget: no extra shrink needed beyond fragsize")
 		}
 	}
 
@@ -1169,6 +1225,246 @@ func (c *DNSClient) testEncoding(enc int) bool {
 	return false
 }
 
+// contentTestPatterns 是 runContentCoverage 跑的字符集探测样本（仿 iodine 的
+// handshake_upenc_autodetect 几个 pat* 串）。每条要求是单个合法 DNS label：
+//
+//	1..63 字符、由 [A-Za-z0-9_-] 组成、不以 '-' 开头。
+//
+// 设计：
+//   - 都以 "aA" 开头：用来检测路径上的 0x20-bit case 随机化（如果链路把首字符
+//     强制大小写化, "aA" 会变 "AA" 或 "aa"）。
+//   - "case-mixed" 只含字母大小写交替, 用来隔离"是不是单纯 case 被吞了"。
+//   - "b64url-full" 加上 base64url 字符集特有的 '_' / 数字 / 末尾 '-',
+//     这俩字符是 base32 字母表里没有的;它们如果被改/丢了, 说明 Base64url
+//     在这条递归上不稳定, 客户端应该降级到 Base32（case-insensitive 的）。
+//
+// 失败诊断更准: 哪个字符在哪个位置被改了, debug 日志单独打。
+var contentTestPatterns = []struct {
+	name string
+	body string
+}{
+	{"case-mixed", "aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ"},
+	{"b64url-full", "aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ_0129-"},
+}
+
+// testContentPattern 用 cmdContentProbe 把 body 当 DATA 段发上去, 服务端原样
+// echo 回来。任何 sent != recv 都说明递归路径上有人改了字符。
+//
+// 失败模式比对照表（iodine 文档说的几种典型）：
+//
+//	'a' → 'A' / 'A' → 'a'         链路在做全大写/全小写转换
+//	'aA' → 'AA' 但其他位 OK        0x20-bit 案例随机化（更隐蔽,但 base64 也死）
+//	'_' / '-' → 其它字符或被剥    base64url 不可用,必须 fallback Base32
+//	长度不匹配（截短/补字节）       链路对长 label 有过滤,需要降级总长
+func (c *DNSClient) testContentPattern(body string) (string, error) {
+	meta := CtrlMeta(cmdContentProbe, 0)
+	fqdn := buildFQDN(body, meta, c.sessionID, c.tld)
+	resp, err := c.sendDNSFew(fqdn)
+	if err != nil {
+		return "", err
+	}
+	return string(resp), nil
+}
+
+// runContentCoverage 顺序跑所有 contentTestPatterns, 逐字节比对发送 vs 收到,
+// debug 日志详细打出"哪个字符被改成了什么"。
+//
+// 副作用: 如果当前选了 Base64url, 但任一 base64-特有字符（'_'/'-' 或字母大小写）
+// 在路上被改/丢了, **降级回 Base32**, 并按 base32 重算 c.upPayload。
+//
+// 这一步不会让握手失败——只是缩窄能力。所有 pattern 都过返回 true; 任一不过
+// 返回 false（让调用方知道这条链路"不太干净"）。
+func (c *DNSClient) runContentCoverage() bool {
+	allOk := true
+	caseSwapped := false
+	b64CharLost := false
+
+	for _, p := range contentTestPatterns {
+		echo, err := c.testContentPattern(p.body)
+		if err != nil {
+			if c.debug {
+				log.Printf("content probe %q: send error: %v", p.name, err)
+			}
+			allOk = false
+			continue
+		}
+		if echo == p.body {
+			if c.debug {
+				log.Printf("content probe %q: ok (%d chars round-trip clean)", p.name, len(p.body))
+			}
+			continue
+		}
+
+		allOk = false
+		// 找第一个不一致的位置, 报具体哪个字符变成了哪个。
+		minLen := len(p.body)
+		if len(echo) < minLen {
+			minLen = len(echo)
+		}
+		diff := -1
+		for i := 0; i < minLen; i++ {
+			if p.body[i] != echo[i] {
+				diff = i
+				break
+			}
+		}
+
+		if c.debug {
+			log.Printf("content probe %q: FAIL (sent %d chars, recv %d chars)", p.name, len(p.body), len(echo))
+			log.Printf("  sent: %s", p.body)
+			log.Printf("  recv: %s", echo)
+		}
+		if diff >= 0 {
+			sCh, rCh := p.body[diff], echo[diff]
+			if c.debug {
+				log.Printf("  first diff at idx %d: %q (0x%02X) → %q (0x%02X)",
+					diff, string(sCh), sCh, string(rCh), rCh)
+			}
+			// case swap: 同字母不同 case。
+			if (sCh >= 'A' && sCh <= 'Z' && rCh == sCh+32) ||
+				(sCh >= 'a' && sCh <= 'z' && rCh == sCh-32) {
+				caseSwapped = true
+			}
+			// base64-特有字符（base32 字母表里没有）被改/丢。
+			if sCh == '_' || sCh == '-' {
+				b64CharLost = true
+			}
+		} else if len(echo) != len(p.body) {
+			// 完全前缀匹配但长度不同 = 链路把字串截短或者补了字节。
+			if c.debug {
+				log.Printf("  length mismatch only (no char swap); path is truncating or padding")
+			}
+		}
+	}
+
+	if (caseSwapped || b64CharLost) && c.encoding == EncBase64 {
+		oldUp := c.upPayload
+		c.encoding = EncBase32
+		c.upPayload = maxUpPayload(c.tld, EncBase32)
+		reason := ""
+		switch {
+		case caseSwapped && b64CharLost:
+			reason = "case + base64 special chars both mangled"
+		case caseSwapped:
+			reason = "0x20-bit case randomization on path"
+		case b64CharLost:
+			reason = "base64 special char (_/-) mangled on path"
+		}
+		if c.debug {
+			log.Printf("Content coverage: downgrading Base64url → Base32 (%s); upstream payload %d → %d",
+				reason, oldUp, c.upPayload)
+		}
+	}
+
+	return allOk
+}
+
+// probeMaxQName —— 二分探测上行 QNAME 字符长度上限。
+//
+// 背景：NS 委派路径上的某些中间递归对长 QNAME（>200 字符）会直接 SERVFAIL。
+// 不探测的话客户端按 maxDNSNameLen=250 切 QNAME,一旦命中阈值整个 chunk
+// 都得等递归 ~10s 超时才放弃,触发上层 fatal rcode tear down。
+//
+// 算法：
+//  1. 先在 floor (100) 上探一次,floor 都过不去说明链路坏了,返回 0。
+//  2. 在 softCeil (= maxDNSNameLen) 上探一次,过了就直接用 softCeil（绝大多数情况）。
+//  3. 否则在 [floor, softCeil-1] 二分,找最大可用 char-len。
+//
+// 探测成本：每次 ~2 秒（dedicated 短超时 + 单 attempt）。最坏 10 次 ≈ 20 秒。
+// 返回值是 QNAME 总字符长度（含 dot,不含 dns.Fqdn 加的 trailing dot）；0 表示探测失败。
+func (c *DNSClient) probeMaxQName() int {
+	const safeFloor = 100
+	softCeil := maxDNSNameLen
+
+	if c.probeQNameLen(softCeil) {
+		return softCeil
+	}
+	if !c.probeQNameLen(safeFloor) {
+		return 0
+	}
+
+	lo, hi := safeFloor, softCeil-1
+	best := safeFloor
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if c.probeQNameLen(mid) {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
+}
+
+// probeQNameLen —— 构造一条 QNAME 总长 = targetCharLen 的探测查询发出,
+// 服务端 cmdQNameProbe 回 "OK"。
+//
+// 使用独立的 dns.Client（短超时 + 单 attempt）避免和后续二分探测互相拖时间。
+// 任何 error / 非 "OK" 回包都视为该长度不可用。
+func (c *DNSClient) probeQNameLen(targetCharLen int) bool {
+	fqdn, ok := c.buildProbeFQDN(targetCharLen)
+	if !ok {
+		return false
+	}
+	qtype := dns.TypeTXT
+	if c.useNULL {
+		qtype = dns.TypeNULL
+	}
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(fqdn), qtype)
+	msg.RecursionDesired = true
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(4096)
+	msg.Extra = append(msg.Extra, opt)
+
+	probeClient := &dns.Client{Net: "udp", ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}
+	if c.debug {
+		log.Printf("probeQNameLen target=%d actual=%d", targetCharLen, len(fqdn))
+	}
+	r, _, err := probeClient.Exchange(msg, c.dnsServer)
+	if err != nil {
+		if c.debug {
+			log.Printf("  probe len=%d: %v", targetCharLen, err)
+		}
+		return false
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		if c.debug {
+			log.Printf("  probe len=%d: rcode %d", targetCharLen, r.Rcode)
+		}
+		return false
+	}
+	ans, err := c.extractAnswer(r)
+	if err != nil || string(ans) != "OK" {
+		if c.debug {
+			log.Printf("  probe len=%d: unexpected resp %q", targetCharLen, string(ans))
+		}
+		return false
+	}
+	return true
+}
+
+// buildProbeFQDN —— 构造完整 FQDN <CMC>.<DATA>.<META>.<SESSION>.<TLD>,
+// 字符总长（不含 dns.Fqdn 加的 trailing dot）恰好为 targetTotalLen。
+//
+// CMC 每次重新生成,避免上游递归缓存把不同长度的探测混在一起。
+func (c *DNSClient) buildProbeFQDN(targetTotalLen int) (string, bool) {
+	suffix := CtrlMeta(cmdQNameProbe, 0) + "." + c.sessionID + "." + c.tld
+	// final = "<CMC><dot><DATA><dot><suffix>" = cmcLength + 1 + dataLen + 1 + len(suffix)
+	dataLen := targetTotalLen - cmcLength - 1 - 1 - len(suffix)
+	if dataLen < 1 {
+		return "", false
+	}
+	data := makeFixedLengthLabels(dataLen)
+	if len(data) != dataLen {
+		return "", false
+	}
+	return generateCMC() + "." + data + "." + suffix, true
+}
+
 // probeFragSize —— 二分查找下行 fragsize 上限。
 //
 // 范围 [100, 1200]（TXT 收窄到 [100, 300]）;每次 testFragSize 让服务端
@@ -1220,6 +1516,140 @@ func (c *DNSClient) testFragSize(size int) bool {
 func (c *DNSClient) commitFragSize(size int) error {
 	sizeStr := formatSize(size)
 	meta := CtrlMeta(cmdFragSize, 1)
+	fqdn := buildFQDN(sizeStr, meta, c.sessionID, c.tld)
+	resp, err := c.sendDNSFew(fqdn)
+	if err != nil {
+		return err
+	}
+	if resp == nil || string(resp) != "OK" {
+		return fmt.Errorf("unexpected commit response: %q", string(resp))
+	}
+	return nil
+}
+
+// buildRespSizeProbeFQDN —— 构造 cmdRespSize probe 的完整 FQDN：
+//
+//	<CMC>.<sizeHex>.<padding>.<meta=ff0B00>.<session>.<tld>
+//
+// 整个 QNAME 字符总长（不含 dns.Fqdn 加的 trailing dot）= targetTotalLen。
+// 服务端只取 dataStr 首段 4 hex 作为 size,padding 段仅用来撑长 QNAME。
+//
+// 这是 cmdFragSize 之外的"组合"探测：固定 QNAME 长度 ≈ 实际数据查询的最坏长,
+// 同时让服务端返回 size 字节 rdata,二分找到稳定上限,推算出总响应预算。
+func (c *DNSClient) buildRespSizeProbeFQDN(size int, targetTotalLen int) (string, bool) {
+	cmc := generateCMC()
+	sizeStr := formatSize(size)
+	meta := CtrlMeta(cmdRespSize, 0)
+	suffix := meta + "." + c.sessionID + "." + c.tld
+	// 布局: <cmc>.<sizeStr>.<padding>.<suffix>
+	// 字符数 = len(cmc) + 1 + len(sizeStr) + 1 + padLen + 1 + len(suffix)
+	padLen := targetTotalLen - len(cmc) - 1 - len(sizeStr) - 1 - 1 - len(suffix)
+	if padLen < 1 {
+		return "", false
+	}
+	pad := makeFixedLengthLabels(padLen)
+	if len(pad) != padLen {
+		return "", false
+	}
+	return cmc + "." + sizeStr + "." + pad + "." + suffix, true
+}
+
+// testRespSize —— 在 targetQName 字符长度下让服务端回 size 字节 probe rdata,
+// 看回包是否完整。任一步失败（i/o timeout / rcode != 0 / 长度不够）即认为
+// 当前 (qname, size) 组合在递归路径上不可用。
+func (c *DNSClient) testRespSize(size int, targetQNameLen int) bool {
+	fqdn, ok := c.buildRespSizeProbeFQDN(size, targetQNameLen)
+	if !ok {
+		return false
+	}
+	qtype := dns.TypeTXT
+	if c.useNULL {
+		qtype = dns.TypeNULL
+	}
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(fqdn), qtype)
+	msg.RecursionDesired = true
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(4096)
+	msg.Extra = append(msg.Extra, opt)
+
+	probeClient := &dns.Client{Net: "udp", ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}
+	r, _, err := probeClient.Exchange(msg, c.dnsServer)
+	if err != nil {
+		if c.debug {
+			log.Printf("  respSize probe qname=%d size=%d: %v", targetQNameLen, size, err)
+		}
+		return false
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		if c.debug {
+			log.Printf("  respSize probe qname=%d size=%d: rcode %d", targetQNameLen, size, r.Rcode)
+		}
+		return false
+	}
+	ans, err := c.extractAnswer(r)
+	if err != nil {
+		return false
+	}
+	return len(ans) >= size
+}
+
+// probeRespTotal —— 在"长 QNAME"下二分探测 rdata 上限,折算出 DNS 总响应字节预算。
+//
+// 输入 qnameLen 一般传 probeMaxQName 探出来的 budget（最坏情况下数据查询会到的字符长）。
+// 二分范围 [100, maxRdata]：maxRdata 取 c.maxFrag + downPktHeaderSize（已 commit 的上限,
+// 单维度下能过）。若组合下仍能过 maxRdata,说明本链路不卡总长,返回 0 表示"无需收紧"。
+// 否则返回 (qnameLen + bestRdata + dnsRespOverhead) 作为总响应预算。
+func (c *DNSClient) probeRespTotal(qnameLen int) int {
+	if qnameLen <= 0 {
+		return 0
+	}
+	maxRdata := c.maxFrag + downPktHeaderSize
+	if maxRdata < 200 {
+		return 0
+	}
+
+	// 先在 maxRdata 上探一次,过了说明本链路在"长 QNAME + 当前 fragsize"下毫无压力,
+	// 不需要再压一档；直接返回 0 让服务端走静态 maxFrag。
+	if c.testRespSize(maxRdata, qnameLen) {
+		if c.debug {
+			log.Printf("respSize probe at qname=%d rdata=%d ok; no total-budget shrink needed",
+				qnameLen, maxRdata)
+		}
+		return 0
+	}
+
+	// floor 也过不去 → 链路不支持长 QNAME + 任何数据 rdata 组合,放弃。
+	const floor = 100
+	if !c.testRespSize(floor, qnameLen) {
+		if c.debug {
+			log.Printf("respSize probe failed at floor (qname=%d rdata=%d)", qnameLen, floor)
+		}
+		return 0
+	}
+
+	lo, hi := floor, maxRdata-1
+	best := floor
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if c.testRespSize(mid, qnameLen) {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	// best 是稳定的最大 rdata；总预算保守加上估计的固定开销。
+	return qnameLen + best + dnsRespOverhead
+}
+
+// commitRespTotal —— 把探到的总响应字节预算告诉服务端,后续按当前查询的
+// QNAME 长度动态收紧 chunk 上限。dataStr 形如 "<budgetHex>"（4 hex）。
+func (c *DNSClient) commitRespTotal(budget int) error {
+	sizeStr := formatSize(budget)
+	meta := CtrlMeta(cmdRespSize, 1)
 	fqdn := buildFQDN(sizeStr, meta, c.sessionID, c.tld)
 	resp, err := c.sendDNSFew(fqdn)
 	if err != nil {
