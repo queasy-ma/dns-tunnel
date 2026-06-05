@@ -5,15 +5,16 @@
 //
 // 关键组件：
 //   - DNSClient        ：客户端运行态,管理监听 socket + sessionID + stream 表。
-//   - dataLoop         ：唯一负责"发上行 + 收下行"的 goroutine,严格 1-in-flight。
+//   - dataLoop         ：唯一负责"发上行 + 收下行"的 goroutine；空闲 1 pending,
+//     活跃时使用 session 级小窗口。
 //   - dnsRecvLoop      ：唯一负责底层 socket 读的 goroutine,解出 DNS 响应送入 recvCh。
 //   - streamReader     ：每个 stream 一个,本地 TCP read → 入 upBuf,唤醒 dataLoop。
 //   - streamWriter     ：每个 stream 一个,从 downBuf 异步写本地 TCP,不阻塞 dataLoop。
 //   - 握手 sendDNS*    ：用独立的 c.dnsClient（同步 Exchange）完成版本协商、编码探测等。
 //
 // 设计取舍 / 关键不变量（详见 DESIGN.md §6.1）：
-//   - **严格 1-in-flight**：在 dataLoop 里用 `inFlight` 标记保证最多 1 个查询在途。
-//     违反它会让 server 端 lazyHeld 兜底节流路径反复触发,QPS 飙到 ~10/s。
+//   - **空闲 1 pending**：没有上行数据时只保留 1 个 poll 查询在途,避免 idle QPS
+//     随窗口翻倍；活跃上行时允许小窗口填充。
 //   - **空闲发包节拍由 server 控制**：客户端"收响应立刻发下一个",自己不加 idle gap；
 //     server 端 lazy hold (~1s) 决定空闲 QPS。
 //   - **dataLoop 不阻塞本地 TCP I/O**：上行写入 upBuf、下行写入 downBuf,真正的 TCP 读 / 写
@@ -33,6 +34,27 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+)
+
+type upFlight struct {
+	active bool
+	seq    uint8
+	sid    uint8
+	data   []byte
+	sentAt time.Time
+	retry  int
+}
+
+type dnsResponse struct {
+	raw    []byte
+	isPoll bool
+}
+
+const (
+	runtimeWindowDownshiftTimeouts   = 3
+	runtimeWindowIncreaseMinInterval = 10 * time.Second
+	runtimeWindowIncreaseCooldown    = 15 * time.Second
+	windowProbeRounds                = 3
 )
 
 // clientStream —— 客户端侧一条 stream 的运行态。
@@ -81,6 +103,8 @@ type DNSClient struct {
 	upPayload   int // 上行单包能塞的明文字节上限
 	qnameBudget int // probeMaxQName 探测出的 QNAME 字符总长上限,0 = 未探或失败
 	respTotal   int // probeRespTotal 探测出的总响应字节预算,0 = 未探或失败
+	window      int // session 级固定小窗口
+	reqWindow   int // client-requested session window, clamped by the server
 
 	// 受 mu 保护：
 	mu          sync.Mutex
@@ -145,12 +169,26 @@ func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain s
 		maxFrag:     maxDownPayloadTXT,
 		encoding:    enc,
 		upPayload:   maxUpPayload(suffix, enc),
+		window:      1,
+		reqWindow:   defaultWindow,
 		streams:     make(map[uint8]*clientStream),
 		nextSID:     1,
 		upNotify:    make(chan struct{}, 1),
 		quit:        make(chan struct{}),
 	}
 	return c, nil
+}
+
+// SetWindow overrides the requested DNS pipeline window for future handshakes.
+// The server still clamps the final value to its supported range.
+func (c *DNSClient) SetWindow(window int) {
+	if window < 1 {
+		window = 1
+	}
+	if window > maxWindow {
+		window = maxWindow
+	}
+	c.reqWindow = window
 }
 
 // MarkRunning 由外部嵌入式使用者调用,把 running 标记成 true。
@@ -436,6 +474,7 @@ func (c *DNSClient) setupTunnel() error {
 	c.maxFrag = maxDownPayloadTXT
 	c.lazyMode = true
 	c.compression = true
+	c.window = 1
 
 	c.mu.Lock()
 	c.streams = make(map[uint8]*clientStream)
@@ -449,8 +488,8 @@ func (c *DNSClient) setupTunnel() error {
 	c.tunnelUp.Store(true)
 
 	if c.debug {
-		log.Printf("Tunnel ready: lazy=%v compress=%v null=%v maxfrag=%d enc=%d",
-			c.lazyMode, c.compression, c.useNULL, c.maxFrag, c.encoding)
+		log.Printf("Tunnel ready: lazy=%v compress=%v null=%v maxfrag=%d enc=%d window=%d",
+			c.lazyMode, c.compression, c.useNULL, c.maxFrag, c.encoding, c.window)
 	}
 	return nil
 }
@@ -462,6 +501,15 @@ func (c *DNSClient) setupTunnel() error {
 func (c *DNSClient) streamReader(stream *clientStream) {
 	buf := make([]byte, 4096)
 	for {
+		for stream.upBuf.Len() >= maxStreamBuffer {
+			c.mu.Lock()
+			closed := stream.closed
+			c.mu.Unlock()
+			if closed {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		n, err := stream.conn.Read(buf)
 		if n > 0 {
 			stream.upBuf.Write(buf[:n])
@@ -534,17 +582,10 @@ func (c *DNSClient) selectUpstream() (uint8, []byte) {
 //
 // 规约：
 //   - 与 dnsRecvLoop 共用一个 UDP socket（net.Dial("udp", server) 后只用这一条）。
-//   - 严格 1-in-flight：每次发包后 inFlight=true,收到响应才 inFlight=false 并发下一个。
-//   - 收到响应就立刻发下一个（不加 idle gap,见 §14 修复演进 #5）。
+//   - Phase 2 session 小窗口：最多 c.window 个 data frame 未 ack。
+//   - 没有上行数据时，idle 只保留 1 个 poll pending；下行活跃时补到窗口上限。
+//   - 收到响应就尽量补窗口（不加 idle gap,见 §14 修复演进 #5）。
 //   - tunnelUp=false 就退出；外层 Accept 循环会触发重连。
-//
-// 三路 select：
-//   - recvCh：收到 DNS 响应,处理 ack + payload；**只在 inFlight==0 时才发下一个**。
-//   - upNotify：streamReader 通知有新上行字节,**只在 inFlight==0 && upAcked 时才 send**。
-//   - timeout：lazy 模式 2s、非 lazy 5s。
-//   - inFlight==0：异常路径（正常应被 server lazy hold 兜住）,补一发。
-//   - inFlight>0：怀疑丢响应,补发一个 retransmit；**不重置 inFlight**,
-//     让 recv 把多发的那个自然消化（详见 timeout 分支注释）。
 func (c *DNSClient) dataLoop() {
 	conn, err := net.Dial("udp", c.dnsServer)
 	if err != nil {
@@ -556,32 +597,37 @@ func (c *DNSClient) dataLoop() {
 	}
 	defer conn.Close()
 
-	recvCh := make(chan []byte, 64)
+	recvCh := make(chan dnsResponse, maxWindow*2)
 	go c.dnsRecvLoop(conn, recvCh)
+	windowNotifyCh := make(chan int, 4)
+	go func() {
+		for n := range windowNotifyCh {
+			c.notifyWindow(n)
+		}
+	}()
+	defer close(windowNotifyCh)
 
-	var upSeq uint8       // 下一次上行帧的 seq
-	var downAck uint8     // 要捎带给服务端的"最近收到的下行 seq"
-	var lastUpData []byte // 重传缓冲：未 ack 的上行 payload
-	var lastUpSID uint8   // 上一次发的 streamID（重传用）
-	upAcked := true       // 上一帧已被服务端 ack
+	var upNextSeq uint8 // 下一次新上行帧的 seq
+	var downAck uint8   // 要捎带给服务端的"最近收到的下行 seq"
+	window := c.window
+	if window < 1 {
+		window = 1
+	}
+	if window > maxWindow {
+		window = maxWindow
+	}
+	windowCap := window
+	var upFlights [maxWindow]upFlight
 	downInited := false   // 是否已经收到过下行,用于 lastDownSeq 初始化
 	var lastDownSeq uint8 // 上次收到的下行 seq,用于去重（同 seq 重传）
-	// inFlight：严格 1-in-flight 不变量。**计数器**,不是布尔。
-	//
-	// 语义：
-	//   - 0：网络上没有未回应的查询,可以自由 send()。
-	//   - 1：稳态（每次 send 后到对应 recv 前）。
-	//   - >1：timeout 重传造成的瞬态;recv 会把它消化掉、**不**触发新 send,
-	//     直到回到 0 才发下一个。
-	//
-	// 历史 bug（DESIGN.md §14 / CLAUDE.md "高频地雷 #2"）：早期是 bool,
-	// timeout 分支直接 c.asyncSend... 重传但 inFlight 不动,等于"幻在途"——
-	// 延迟的原响应回来后客户端立刻 send,网络上稳态 2-in-flight。两个 query
-	// 撞进服务端时,一个占住 lazyHeld 1s,另一个走 concurrentPoll 空响应秒回——
-	// 形成 30/秒 自维持空 poll 风暴。改成计数器 + "inFlight==0 才发"的 gate
-	// 后,timeout 重传只会瞬态 2-in-flight,recv 拿到第一个响应不触发新 send,
-	// 等第二个响应回来 inFlight 回 0,才发下一个。
-	inFlight := 0
+	downDeliveredSeq := uint8(0)
+	downReorder := make(map[uint8]*DownPkt)
+	queryInFlight := 0 // 总 DNS 查询在途数；data/poll 都必须受它背压。
+	pollInFlight := 0  // 只统计 poll 查询,用于 idle/active-down credit。
+	downActiveUntil := time.Time{}
+	dataTimeouts := 0
+	stableDataAcks := 0
+	nextWindowIncreaseAt := time.Now().Add(runtimeWindowIncreaseMinInterval)
 
 	// lazy 降级跟踪（参考 iodine client.c send_query）：
 	// windowSent/windowRecv 统计 dataLoop 启动后的发送/接收量。
@@ -590,37 +636,258 @@ func (c *DNSClient) dataLoop() {
 	windowSent := 0
 	windowRecv := 0
 
-	// send —— 发一个查询。优先重传未 ack 的旧帧,否则从 selectUpstream 取新数据,
-	// 都没有的话发 poll。**调用方负责确认 inFlight==0 (或在 timeout 重传场景下接受瞬态 >1)**。
-	send := func() {
-		if !upAcked && lastUpData != nil {
-			if c.debug {
-				log.Printf("send: retransmit unacked sid=%d seq=%d len=%d ack=%d",
-					lastUpSID, upSeq, len(lastUpData), downAck)
-			}
-			c.asyncSendStreamData(conn, lastUpSID, lastUpData, upSeq, downAck)
-		} else {
-			sid, data := c.selectUpstream()
-			if data != nil {
-				lastUpSID = sid
-				lastUpData = data
-				upAcked = false
-				if c.debug {
-					log.Printf("send: new data sid=%d seq=%d len=%d ack=%d", sid, upSeq, len(data), downAck)
-				}
-				c.asyncSendStreamData(conn, sid, data, upSeq, downAck)
-			} else {
-				if c.debug {
-					log.Printf("send: poll (no upstream data) ack=%d", downAck)
-				}
-				c.asyncSendPoll(conn, downAck)
+	countUpFlights := func() int {
+		n := 0
+		for i := range upFlights {
+			if upFlights[i].active {
+				n++
 			}
 		}
+		return n
+	}
+	firstFreeUpSlot := func() int {
+		for i := range upFlights {
+			if !upFlights[i].active {
+				return i
+			}
+		}
+		return -1
+	}
+	oldestUpFlight := func() *upFlight {
+		var oldest *upFlight
+		for i := range upFlights {
+			f := &upFlights[i]
+			if !f.active {
+				continue
+			}
+			if oldest == nil || f.sentAt.Before(oldest.sentAt) {
+				oldest = f
+			}
+		}
+		return oldest
+	}
+	hasBufferedUpstream := func() bool {
+		c.mu.Lock()
+		streams := make([]*clientStream, 0, len(c.streams))
+		for _, stream := range c.streams {
+			streams = append(streams, stream)
+		}
+		c.mu.Unlock()
+		for _, stream := range streams {
+			if stream.upBuf.Len() > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	hasUpstreamBacklog := func() bool {
+		return countUpFlights() > 0 || hasBufferedUpstream()
+	}
+	notifyRuntimeWindow := func(n int) {
+		select {
+		case windowNotifyCh <- n:
+		default:
+			select {
+			case <-windowNotifyCh:
+			default:
+			}
+			select {
+			case windowNotifyCh <- n:
+			default:
+			}
+		}
+	}
+	maybeIncreaseWindow := func(released int) {
+		if released <= 0 {
+			return
+		}
+		dataTimeouts = 0
+		if window >= windowCap {
+			stableDataAcks = 0
+			return
+		}
+		if !hasUpstreamBacklog() {
+			stableDataAcks = 0
+			return
+		}
+		stableDataAcks += released
+		target := windowIncreaseAckTarget(window)
+		if stableDataAcks < target || time.Now().Before(nextWindowIncreaseAt) {
+			return
+		}
+		oldWindow := window
+		window++
+		if window > windowCap {
+			window = windowCap
+		}
+		c.window = window
+		stableDataAcks = 0
+		nextWindowIncreaseAt = time.Now().Add(runtimeWindowIncreaseMinInterval)
+		if c.debug {
+			log.Printf("runtime window increase: %d -> %d after %d stable data acks (cap=%d)",
+				oldWindow, window, target, windowCap)
+		}
+		notifyRuntimeWindow(window)
+	}
+	sendNewData := func() bool {
+		slot := firstFreeUpSlot()
+		if slot < 0 {
+			return false
+		}
+		sid, data := c.selectUpstream()
+		if data == nil {
+			return false
+		}
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		upFlights[slot] = upFlight{
+			active: true,
+			seq:    upNextSeq,
+			sid:    sid,
+			data:   buf,
+			sentAt: time.Now(),
+		}
+		if c.debug {
+			log.Printf("send: new data sid=%d seq=%d len=%d ack=%d upInFlight=%d/%d queries=%d",
+				sid, upNextSeq, len(buf), downAck, countUpFlights(), window, queryInFlight+1)
+		}
+		c.asyncSendStreamData(conn, sid, buf, upNextSeq, downAck)
+		upNextSeq = nextSeq(upNextSeq)
+		queryInFlight++
 		windowSent++
-		inFlight++
+		return true
+	}
+	sendRetransmit := func() bool {
+		f := oldestUpFlight()
+		if f == nil {
+			return false
+		}
+		f.sentAt = time.Now()
+		f.retry++
+		if c.debug {
+			log.Printf("send: retransmit sid=%d seq=%d len=%d ack=%d retry=%d upInFlight=%d/%d queries=%d",
+				f.sid, f.seq, len(f.data), downAck, f.retry, countUpFlights(), window, queryInFlight+1)
+		}
+		c.asyncSendStreamData(conn, f.sid, f.data, f.seq, downAck)
+		queryInFlight++
+		windowSent++
+		return true
+	}
+	isDownActive := func() bool {
+		return !downActiveUntil.IsZero() && time.Now().Before(downActiveUntil)
+	}
+	markDownActive := func() {
+		downActiveUntil = time.Now().Add(2 * lazyTimeout)
+	}
+	sendPoll := func() {
+		if c.debug {
+			mode := "idle"
+			if isDownActive() {
+				mode = "active-down"
+			}
+			upBacklog := hasUpstreamBacklog()
+			if upBacklog {
+				mode = "upstream-backlog"
+			}
+			log.Printf("send: poll (%s, no upstream data) ack=%d polls=%d/%d queries=%d",
+				mode, downAck, pollInFlight+1, pollCredit(isDownActive(), upBacklog, window), queryInFlight+1)
+		}
+		c.asyncSendPoll(conn, downAck)
+		pollInFlight++
+		queryInFlight++
+		windowSent++
+	}
+	releaseAcked := func(ack uint8) int {
+		released := 0
+		for i := range upFlights {
+			f := &upFlights[i]
+			if !f.active {
+				continue
+			}
+			if ackCovers(ack, f.seq) {
+				if c.debug {
+					log.Printf("  ack accepted: seq=%d covered by ack=%d (slot=%d)", f.seq, ack, i)
+				}
+				upFlights[i] = upFlight{}
+				released++
+			}
+		}
+		return released
+	}
+	deliverDown := func(pkt *DownPkt) bool {
+		c.processDown(pkt, &downAck, &downInited, &lastDownSeq)
+		return len(pkt.Payload) > 0 || (pkt.StreamClosed && pkt.StreamID > 0)
+	}
+	handleDown := func(pkt *DownPkt) bool {
+		if pkt.Closed {
+			deliverDown(pkt)
+			return false
+		}
+		ordered := len(pkt.Payload) > 0 || (pkt.StreamClosed && pkt.StreamID > 0)
+		if !ordered {
+			deliverDown(pkt)
+			return false
+		}
+		expected := nextSeq(downDeliveredSeq)
+		if pkt.Seq == expected {
+			active := deliverDown(pkt)
+			downDeliveredSeq = pkt.Seq
+			for {
+				next := nextSeq(downDeliveredSeq)
+				queued, ok := downReorder[next]
+				if !ok {
+					break
+				}
+				delete(downReorder, next)
+				active = deliverDown(queued) || active
+				downDeliveredSeq = next
+			}
+			return active
+		} else if seqInWindow(pkt.Seq, expected, window) {
+			downReorder[pkt.Seq] = pkt
+			if c.debug {
+				log.Printf("  down reorder: cached future seq=%d expected=%d delivered=%d",
+					pkt.Seq, expected, downDeliveredSeq)
+			}
+		} else if c.debug {
+			log.Printf("  down reorder: drop old/far seq=%d expected=%d delivered=%d",
+				pkt.Seq, expected, downDeliveredSeq)
+		}
+		return false
+	}
+	pump := func() {
+		sentData := false
+		for canSendUpData(countUpFlights(), queryInFlight, window) {
+			if !sendNewData() {
+				break
+			}
+			sentData = true
+		}
+		if sentData {
+			return
+		}
+		if countUpFlights() > 0 {
+			if queryInFlight == 0 {
+				sendRetransmit()
+			}
+			return
+		}
+		active := isDownActive()
+		upBacklog := hasBufferedUpstream()
+		clampedPolls := clampPollInFlight(pollInFlight, active, upBacklog, window)
+		if clampedPolls != pollInFlight {
+			if c.debug {
+				log.Printf("poll credit clamp: polls=%d -> %d credit=%d",
+					pollInFlight, clampedPolls, pollCredit(active, upBacklog, window))
+			}
+			pollInFlight = clampedPolls
+		}
+		for canSendPoll(pollInFlight, queryInFlight, active, upBacklog, window) {
+			sendPoll()
+		}
 	}
 
-	send()
+	pump()
 
 	for c.tunnelUp.Load() {
 		timeout := 5 * time.Second
@@ -631,33 +898,29 @@ func (c *DNSClient) dataLoop() {
 		}
 
 		select {
-		case raw := <-recvCh:
+		case resp := <-recvCh:
 			windowRecv++
-			if inFlight > 0 {
-				inFlight--
+			if queryInFlight > 0 {
+				queryInFlight--
 			}
-			pkt := c.decodeResponse(raw)
+			if resp.isPoll && pollInFlight > 0 {
+				pollInFlight--
+			}
+			pkt := c.decodeResponse(resp.raw)
 			if pkt == nil {
 				if c.debug {
-					log.Printf("recv: decode failed (len=%d), skip", len(raw))
+					log.Printf("recv: decode failed (len=%d), skip", len(resp.raw))
 				}
 			} else {
 				if c.debug {
-					log.Printf("recv: pkt seq=%d ack=%d sid=%d payload=%d flags=%s inFlight=%d",
-						pkt.Seq, pkt.Ack, pkt.StreamID, len(pkt.Payload), pktFlags(pkt), inFlight)
+					log.Printf("recv: pkt seq=%d ack=%d sid=%d payload=%d flags=%s polls=%d/%d queries=%d upInFlight=%d/%d",
+						pkt.Seq, pkt.Ack, pkt.StreamID, len(pkt.Payload), pktFlags(pkt),
+						pollInFlight, pollCredit(isDownActive(), hasUpstreamBacklog(), window), queryInFlight, countUpFlights(), window)
 				}
-				c.processDown(pkt, &downAck, &downInited, &lastDownSeq)
-				if !upAcked && pkt.Ack == upSeq {
-					if c.debug {
-						log.Printf("  ack accepted: upSeq %d → %d", upSeq, nextSeq(upSeq))
-					}
-					upAcked = true
-					upSeq = nextSeq(upSeq)
-					lastUpData = nil
-				} else if !upAcked && c.debug {
-					log.Printf("  ack mismatch: got=%d want=%d (still waiting, will retransmit)",
-						pkt.Ack, upSeq)
+				if handleDown(pkt) {
+					markDownActive()
 				}
+				maybeIncreaseWindow(releaseAcked(pkt.Ack))
 			}
 
 			// processDown 里如果收到 Closed 标志会把 tunnelUp 置 false。
@@ -668,29 +931,10 @@ func (c *DNSClient) dataLoop() {
 				return
 			}
 
-			// 严格 1-in-flight 关键 gate：只在 inFlight==0 时发下一个。
-			// inFlight>0 说明此前 timeout 多发过 retransmit、网络上还有别的
-			// 响应没回来,**不**触发新 send,等剩下的响应自然消化。
-			// 这是消除自维持空 poll 风暴的核心机制（见上方 inFlight 注释）。
-			if inFlight == 0 {
-				send()
-			} else if c.debug {
-				log.Printf("recv: drain mode, inFlight=%d still pending, no send", inFlight)
-			}
+			pump()
 
 		case <-c.upNotify:
-			// streamReader 通知有新上行字节。只在 inFlight==0 && upAcked 时发,
-			// 否则违反 1-in-flight；下一次 recvCh 触发 send() 时 selectUpstream
-			// 也会取到这些字节,数据不会丢。
-			if inFlight == 0 && upAcked {
-				if c.debug {
-					log.Printf("upNotify: triggering send (inFlight=0 upAcked=true)")
-				}
-				send()
-			} else if c.debug {
-				log.Printf("upNotify: gated (inFlight=%d upAcked=%v) — will be picked up on next recv",
-					inFlight, upAcked)
-			}
+			pump()
 
 		case <-time.After(timeout):
 			// lazy 降级检测（参考 iodine）：发了 >6 个查询却收不到任何响应，
@@ -707,13 +951,41 @@ func (c *DNSClient) dataLoop() {
 				}()
 			}
 
-			if inFlight > 0 && c.debug {
-				log.Printf("timeout(%v): suspect response lost, retransmit (inFlight %d → %d)",
-					timeout, inFlight, inFlight+1)
-			} else if c.debug {
-				log.Printf("timeout(%v): no inflight, idle send", timeout)
+			if queryInFlight > 0 {
+				if c.debug {
+					log.Printf("timeout(%v): suspect response lost (polls=%d queries=%d upInFlight=%d/%d)",
+						timeout, pollInFlight, queryInFlight, countUpFlights(), window)
+				}
+				if countUpFlights() > 0 {
+					dataTimeouts++
+					stableDataAcks = 0
+					if dataTimeouts >= runtimeWindowDownshiftTimeouts && window > 1 {
+						oldWindow := window
+						window = window / 2
+						if window < 1 {
+							window = 1
+						}
+						c.window = window
+						dataTimeouts = 0
+						nextWindowIncreaseAt = time.Now().Add(runtimeWindowIncreaseCooldown)
+						if c.debug {
+							log.Printf("runtime window downshift: %d -> %d after %d consecutive data timeouts (cap=%d)",
+								oldWindow, window, runtimeWindowDownshiftTimeouts, windowCap)
+						}
+						notifyRuntimeWindow(window)
+					}
+				}
+				queryInFlight = 0
+				pollInFlight = 0
+				if !sendRetransmit() {
+					pump()
+				}
+			} else {
+				if c.debug {
+					log.Printf("timeout(%v): no queries in flight, pump", timeout)
+				}
+				pump()
 			}
-			send()
 		}
 	}
 }
@@ -746,7 +1018,7 @@ func pktFlags(p *DownPkt) string {
 // 流程：
 //  1. Closed flag → tunnelUp=false,dataLoop 退出。
 //  2. StreamClosed → 标记 stream.closing,writer 排空 downBuf 后关 socket。
-//  3. payload + 新 seq → 入 downBuf + downSig 唤醒 writer + 更新 downAck/lastDownSeq。
+//  3. payload / StreamClosed + 新 seq → 有序交付并更新 downAck/lastDownSeq。
 //
 // **去重**：pkt.Seq == lastDownSeq 表示同 seq 重传,跳过 payload 处理（避免重复写）。
 func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, lastDownSeq *uint8) {
@@ -776,6 +1048,13 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 		}
 		if c.debug {
 			log.Printf("  StreamClosed sid=%d (closing-then-close, found=%v)", pkt.StreamID, ok)
+		}
+		if !*downInited || pkt.Seq != *lastDownSeq {
+			if !*downInited {
+				*downInited = true
+			}
+			*downAck = pkt.Seq
+			*lastDownSeq = pkt.Seq
 		}
 	}
 
@@ -827,10 +1106,10 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 //     （可能重启了、或者编码协商失败）。直接 tunnelUp=false,Start 循环会重连。
 //   - 其它致命错误（i/o 永久错）：tunnelUp=false。
 //
-// **背压**：recvCh 容量 64,写入时给 100ms 超时；超时丢包并打日志。
+// **背压**：recvCh 容量随 maxWindow 放大,写入时给 100ms 超时；超时丢包并打日志。
 // 历史 bug（DESIGN.md §14 #8）：早期 `default` 直接丢,dataLoop 偶尔卡一下就静默丢响应,
 // 看似稳定但偶现死锁。
-func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
+func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- dnsResponse) {
 	buf := make([]byte, 65536)
 	for c.tunnelUp.Load() {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -864,11 +1143,11 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 				}
 				continue
 			}
+			qname := ""
+			if len(msg.Question) > 0 {
+				qname = msg.Question[0].Name
+			}
 			if c.debug {
-				qname := ""
-				if len(msg.Question) > 0 {
-					qname = msg.Question[0].Name
-				}
 				log.Printf("DNS recv: %d bytes id=%d rcode=%d answers=%d qname=%s",
 					n, msg.Id, msg.Rcode, len(msg.Answer), qname)
 			}
@@ -910,8 +1189,9 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 			// 复制一份,避免下次 Read 复用 buf 时把数据覆盖了。
 			data := make([]byte, len(raw))
 			copy(data, raw)
+			resp := dnsResponse{raw: data, isPoll: responseIsPoll(qname)}
 			select {
-			case ch <- data:
+			case ch <- resp:
 			case <-time.After(100 * time.Millisecond):
 				if c.debug {
 					log.Printf("recv channel backpressure, dropping packet")
@@ -919,6 +1199,11 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- []byte) {
 			}
 		}
 	}
+}
+
+func responseIsPoll(qname string) bool {
+	labels := strings.Split(strings.TrimSuffix(qname, "."), ".")
+	return len(labels) >= 2 && strings.EqualFold(labels[1], "P")
 }
 
 // asyncSendPoll —— 发一个 P 命令空查询,纯粹捎带 downAck 收下行。
@@ -1167,7 +1452,169 @@ func (c *DNSClient) handshake() error {
 		c.compression = false
 	}
 
+	selectedWindow := c.probeWindow(c.reqWindow)
+	if err := c.commitWindow(selectedWindow); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func (c *DNSClient) probeWindow(requested int) int {
+	candidates := windowProbeCandidates(requested)
+	for _, candidate := range candidates {
+		if c.testWindow(candidate) {
+			if c.debug {
+				log.Printf("Window probe selected: requested=%d actual=%d", requested, candidate)
+			}
+			return candidate
+		}
+		if c.debug {
+			log.Printf("Window probe: n=%d failed, trying lower window", candidate)
+		}
+	}
+	best := windowProbeFallback(requested)
+	if c.debug {
+		log.Printf("Window probe fallback: requested=%d actual=%d (all probe rounds failed)", requested, best)
+	}
+	return best
+}
+
+func (c *DNSClient) testWindow(n int) bool {
+	if n < 1 {
+		n = 1
+	}
+	for round := 1; round <= windowProbeRounds; round++ {
+		if c.testWindowRound(n, round) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *DNSClient) testWindowRound(n, round int) bool {
+	var wg sync.WaitGroup
+	results := make(chan bool, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results <- c.testWindowProbeOnce(n, round, idx)
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	ok := 0
+	for result := range results {
+		if result {
+			ok++
+		}
+	}
+	if c.debug {
+		log.Printf("Window probe n=%d round=%d/%d: %d/%d ok", n, round, windowProbeRounds, ok, n)
+	}
+	return ok == n
+}
+
+func (c *DNSClient) testWindowProbeOnce(n, round, idx int) bool {
+	meta := CtrlMeta(cmdWindow, 0)
+	data := fmt.Sprintf("W%02x%02x%02x", n, round, idx)
+	fqdn := generateCMC() + "." + buildFQDN(data, meta, c.sessionID, c.tld)
+	qtype := dns.TypeTXT
+	if c.useNULL {
+		qtype = dns.TypeNULL
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(fqdn), qtype)
+	msg.RecursionDesired = true
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(4096)
+	msg.Extra = append(msg.Extra, opt)
+
+	probeClient := &dns.Client{Net: "udp", ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
+	r, _, err := probeClient.Exchange(msg, c.dnsServer)
+	if err != nil {
+		if c.debug {
+			log.Printf("  window probe n=%d round=%d idx=%d: %v", n, round, idx, err)
+		}
+		return false
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		if c.debug {
+			log.Printf("  window probe n=%d round=%d idx=%d: rcode %d", n, round, idx, r.Rcode)
+		}
+		return false
+	}
+	ans, err := c.extractAnswer(r)
+	if err != nil {
+		if c.debug {
+			log.Printf("  window probe n=%d round=%d idx=%d: answer error %v", n, round, idx, err)
+		}
+		return false
+	}
+	resp := string(ans)
+	if !strings.HasPrefix(resp, "OK,") {
+		if c.debug {
+			log.Printf("  window probe n=%d round=%d idx=%d: unexpected resp %q", n, round, idx, resp)
+		}
+		return false
+	}
+	return true
+}
+
+func (c *DNSClient) commitWindow(requested int) error {
+	if requested < 1 {
+		requested = 1
+	}
+	if requested > maxWindow {
+		requested = maxWindow
+	}
+	meta := CtrlMeta(cmdWindow, uint8(requested))
+	fqdn := buildFQDN("W", meta, c.sessionID, c.tld)
+	resp, err := c.sendDNS(fqdn)
+	if err != nil {
+		return fmt.Errorf("window commit failed: %v", err)
+	}
+	respStr := string(resp)
+	parts := strings.Split(respStr, ",")
+	if len(parts) != 2 || parts[0] != "OK" {
+		return fmt.Errorf("malformed window response: %q", respStr)
+	}
+	actual, err := strconv.Atoi(parts[1])
+	if err != nil || actual < 1 {
+		return fmt.Errorf("bad window response: %q", respStr)
+	}
+	if actual > maxWindow {
+		actual = maxWindow
+	}
+	c.window = actual
+	if c.debug {
+		log.Printf("Window committed: requested=%d actual=%d", requested, actual)
+	}
+	return nil
+}
+
+func (c *DNSClient) notifyWindow(window int) {
+	if window < 1 {
+		window = 1
+	}
+	if window > maxWindow {
+		window = maxWindow
+	}
+	meta := CtrlMeta(cmdWindow, uint8(window))
+	fqdn := buildFQDN("W", meta, c.sessionID, c.tld)
+	resp, err := c.sendDNSRetries(fqdn, 3)
+	if c.debug {
+		if err != nil {
+			log.Printf("runtime window notify failed: window=%d err=%v", window, err)
+		} else {
+			log.Printf("runtime window notify: window=%d resp=%q", window, string(resp))
+		}
+	}
 }
 
 // testNULLRecord —— 用一个 NULL 类型查询试探链路是否支持 NULL 记录。

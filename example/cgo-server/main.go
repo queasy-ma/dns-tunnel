@@ -105,6 +105,11 @@ func StartDnsServer(dnsListen *C.char, tcpDest *C.char,
 
 	go func() {
 		_ = server.Start()
+		serverMu.Lock()
+		if dnsServer == server {
+			dnsServer = nil
+		}
+		serverMu.Unlock()
 	}()
 	return 0
 }

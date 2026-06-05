@@ -23,7 +23,7 @@
 // 不同 session 之间几乎完全独立（仅 DNSServer.mu 在 getOrCreateSession 短暂持有）。
 //
 // 设计参考 iodine：
-//   - 非阻塞 lazy：handler 不阻塞等数据，而是把查询存到 session.pending，
+//   - 非阻塞 lazy：handler 不阻塞等数据，而是把查询存到 session.pendingList，
 //     TCP reader 有新数据时通过 fulfillPending 立即应答。
 //   - id2/from2 双发：解析器重试时合并为 pending.w2，应答时双发给两个出口。
 //   - pending 超时：time.AfterFunc(lazyTimeout) 到期后回空 DownPkt。
@@ -54,7 +54,7 @@ type dnsCacheEntry struct {
 // pendingQuery —— 非阻塞 lazy hold 的存储槽位（参考 iodine 的 users[userid].q）。
 //
 // 当 handlePollWithAck 发现无下行数据且 lazyMode=true 时，不阻塞 handler，
-// 而是把当前查询的 ResponseWriter / Msg 存到 session.pending。TCP reader
+// 而是把当前查询的 ResponseWriter / Msg 存到 session.pendingList。TCP reader
 // 有新数据时调 fulfillPending 取出并立即应答；超时（lazyTimeout）则回空 DownPkt。
 //
 // id2/from2 双发（参考 iodine 的 q.id2/q.from2）：解析器重试（同 QNAME
@@ -66,6 +66,7 @@ type pendingQuery struct {
 	q   dns.Question
 
 	qnameLower string // strings.ToLower(q.Name)，用于合并匹配
+	timer      *time.Timer
 
 	// 解析器重试的第二路出口（id2/from2）
 	w2    dns.ResponseWriter
@@ -73,11 +74,25 @@ type pendingQuery struct {
 	hasW2 bool
 }
 
+type upFrame struct {
+	sid  uint8
+	data []byte
+}
+
+type downFlight struct {
+	active       bool
+	seq          uint8
+	sid          uint8
+	chunk        []byte
+	streamClosed bool
+	sentAt       time.Time
+}
+
 const (
 	// dnsCacheSize —— L1 精确 / CI 缓存 ring 的容量。
-	dnsCacheSize = 8
+	dnsCacheSize = 256
 	// qmemSize —— L2 qmem CMC ring 的容量。
-	qmemSize = 30
+	qmemSize = 256
 )
 
 // Stream —— 服务端侧一条 TCP 流的运行态。
@@ -106,17 +121,14 @@ type Session struct {
 
 	server *DNSServer // 反向引用，供 startTCPReader/Writer 调 fulfillPending
 
-	// 上行 seq 跟踪：检测同一 seq 的重传（不会重复 write 到真实 TCP）。
-	upRecvSeq uint8 // 当前已确认收到的最新上行 seq
-	upInited  bool  // 收到过第一帧之前的初始化标志
+	// 上行累计 ack / reorder。upRecvSeq 是当前已交付到真实 TCP writer 队列的
+	// 最新 seq；新 session 初始化为 254,因此第一帧固定期望 0。
+	upRecvSeq uint8
+	upReorder map[uint8]upFrame
 
-	// 下行单 slot stop-and-wait 状态：
-	//   - 同一时刻最多 1 个未 ack 的 downChunk 在途。
-	//   - downAcked == false 表示这个 chunk 还在等 client ack；poll 到来时按 ack 推进。
-	downSeq      uint8
-	downChunk    []byte
-	downChunkSID uint8
-	downAcked    bool
+	// 下行 session 级小窗口。每个 DNS query 仍只回一个 DownPkt,窗口来自多个 query 并发。
+	downNext    uint8
+	downFlights [maxWindow]downFlight
 
 	// 握手协商出的会话级配置。握手完成后写入,后续只读。
 	lazyMode    bool
@@ -124,6 +136,7 @@ type Session struct {
 	useNULL     bool
 	maxFrag     int
 	encoding    int
+	window      int
 	// respTotalBudget 是 cmdRespSize commit 来的"DNS 总响应字节预算"。0 = 未探测,
 	// 走静态 maxFrag。>0 时按当前 q.Name 长度动态收紧 chunk 上限,避免"长 QNAME
 	// + 大 rdata"组合超过递归路径的 UDP / EDNS 阈值被静默丢包。
@@ -139,12 +152,9 @@ type Session struct {
 	qmemIdx  int
 	qmemFill int
 
-	// 非阻塞 lazy hold（参考 iodine 的 users[userid].q）：
-	//   - pending：当前存储的查询，等待 TCP 数据到达后应答。
-	//   - pendingTimer：lazyTimeout 后自动回空 DownPkt 的定时器。
-	// 同一时刻最多 1 个 pending；新 poll 到达时旧 pending 被回空替换。
-	pending      *pendingQuery
-	pendingTimer *time.Timer
+	// 非阻塞 lazy hold pending 列表。Phase 2 允许最多 window 个 pending,
+	// 同 QNAME 仍合并到同一 pending 的 id2/from2 双发槽。
+	pendingList []*pendingQuery
 }
 
 // Close —— 关 session。
@@ -158,22 +168,18 @@ func (s *Session) Close() {
 	}
 	s.closed = true
 
-	// 清理 pending query。
-	// Stop() 返回 true 表示定时器被成功拦截、回调不会再执行，须手动处理 pending；
-	// Stop() 返回 false 表示回调已开始执行（可能正在等 mu），由回调自行处理。
-	if s.pendingTimer != nil {
-		if s.pendingTimer.Stop() && s.pending != nil {
-			p := s.pending
-			s.pending = nil
-			ack := s.upRecvSeq
-			// 异步发送：Close 持有 mu，sendPendingResponse 内部也会短暂 lock mu。
-			go func() {
-				if s.server != nil {
-					s.server.sendPendingResponse(s, p, &DownPkt{Ack: ack, Closed: true, LastFrag: true})
-				}
-			}()
+	pending := s.pendingList
+	s.pendingList = nil
+	ack := s.upRecvSeq
+	for _, p := range pending {
+		if p.timer != nil {
+			p.timer.Stop()
 		}
-		s.pendingTimer = nil
+		go func(p *pendingQuery) {
+			if s.server != nil {
+				s.server.sendPendingResponse(s, p, &DownPkt{Ack: ack, Closed: true, LastFrag: true})
+			}
+		}(p)
 	}
 
 	for _, st := range s.streams {
@@ -213,6 +219,11 @@ func (st *Stream) startTCPReader(session *Session) {
 			session.mu.Unlock()
 			return
 		}
+		if len(st.downBuf) >= maxStreamBuffer {
+			session.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		conn := st.conn
 		session.mu.Unlock()
 		if conn == nil {
@@ -224,8 +235,12 @@ func (st *Stream) startTCPReader(session *Session) {
 		if n > 0 {
 			session.mu.Lock()
 			st.downBuf = append(st.downBuf, buf[:n]...)
+			downBufLen := len(st.downBuf)
 			session.lastActive = time.Now()
 			session.mu.Unlock()
+			if session.server != nil && session.server.debug {
+				log.Printf("stream %d: TCP read %d bytes -> downBuf (now=%d)", st.id, n, downBufLen)
+			}
 
 			if session.server != nil {
 				session.server.fulfillPending(session)
@@ -238,6 +253,9 @@ func (st *Stream) startTCPReader(session *Session) {
 			session.mu.Lock()
 			st.closed = true
 			session.mu.Unlock()
+			if session.server != nil && session.server.debug {
+				log.Printf("stream %d: TCP read error/EOF: %v", st.id, err)
+			}
 
 			if session.server != nil {
 				session.server.fulfillPending(session)
@@ -322,6 +340,102 @@ func (s *Session) getClosedStreamToNotify() uint8 {
 		}
 	}
 	return 0
+}
+
+// **必须**持有 session.mu。
+func (s *Session) countDownFlights() int {
+	n := 0
+	for i := range s.downFlights {
+		if s.downFlights[i].active {
+			n++
+		}
+	}
+	return n
+}
+
+// **必须**持有 session.mu。
+func (s *Session) firstFreeDownSlot() int {
+	for i := range s.downFlights {
+		if !s.downFlights[i].active {
+			return i
+		}
+	}
+	return -1
+}
+
+// **必须**持有 session.mu。
+func (s *Session) addDownDataFlight(sid uint8, chunk []byte) (downFlight, int) {
+	slot := s.firstFreeDownSlot()
+	seq := s.downNext
+	s.downNext = nextSeq(s.downNext)
+	flight := downFlight{active: true, seq: seq, sid: sid, chunk: chunk, sentAt: time.Now()}
+	s.downFlights[slot] = flight
+	return flight, slot
+}
+
+// **必须**持有 session.mu。
+func (s *Session) addDownCloseFlight(sid uint8) (downFlight, int) {
+	slot := s.firstFreeDownSlot()
+	seq := s.downNext
+	s.downNext = nextSeq(s.downNext)
+	flight := downFlight{active: true, seq: seq, sid: sid, streamClosed: true, sentAt: time.Now()}
+	s.downFlights[slot] = flight
+	return flight, slot
+}
+
+// **必须**持有 session.mu。
+func (s *Session) releaseDownAck(ack uint8) []uint8 {
+	var released []uint8
+	for i := range s.downFlights {
+		f := &s.downFlights[i]
+		if !f.active {
+			continue
+		}
+		if ackCovers(ack, f.seq) {
+			released = append(released, f.seq)
+			s.downFlights[i] = downFlight{}
+		}
+	}
+	return released
+}
+
+// **必须**持有 session.mu。
+func (s *Session) oldestDownFlight() *downFlight {
+	var oldest *downFlight
+	for i := range s.downFlights {
+		f := &s.downFlights[i]
+		if !f.active {
+			continue
+		}
+		if oldest == nil || f.sentAt.Before(oldest.sentAt) {
+			oldest = f
+		}
+	}
+	return oldest
+}
+
+// **必须**持有 session.mu。
+func (s *Session) removePending(expected *pendingQuery) bool {
+	for i, p := range s.pendingList {
+		if p == expected {
+			s.pendingList = append(s.pendingList[:i], s.pendingList[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// **必须**持有 session.mu。
+func (s *Session) popOldestPending() *pendingQuery {
+	if len(s.pendingList) == 0 {
+		return nil
+	}
+	p := s.pendingList[0]
+	s.pendingList = s.pendingList[1:]
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	return p
 }
 
 // saveToDNSCache —— L1：把响应字节存进 dnsCache ring。
@@ -533,8 +647,10 @@ func (s *DNSServer) getOrCreateSession(sessionID string) (*Session, error) {
 		compression: false,
 		lazyMode:    true,
 		useNULL:     false,
-		downSeq:     1,    // 从 1 开始,避免与客户端初始 ack=0 产生歧义
-		downAcked:   true, // 初始无未 ack 的下行,允许立即取新 chunk
+		upRecvSeq:   maxSeqNo, // 累计 ack 初始为"0 的前一个",避免 future seq 误 ack seq=0
+		upReorder:   make(map[uint8]upFrame),
+		downNext:    1, // 从 1 开始,避免与客户端初始 ack=0 产生歧义
+		window:      1,
 		streams:     make(map[uint8]*Stream),
 		server:      s,
 	}
@@ -744,15 +860,19 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	// pending 合并（iodine id2/from2）：同 QNAME 的解析器重试存为双发目标。
 	// miekg/dns 的 UDP ResponseWriter 在 handler 返回后仍可写（不会自动 Close），
 	// 因此存下来延迟使用是安全的。
-	if session.pending != nil && strings.ToLower(question.Name) == session.pending.qnameLower {
-		if !session.pending.hasW2 {
-			session.pending.w2 = w
-			session.pending.msg2 = msg
-			session.pending.hasW2 = true
+	qnameLower := strings.ToLower(question.Name)
+	for _, pending := range session.pendingList {
+		if qnameLower != pending.qnameLower {
+			continue
+		}
+		if !pending.hasW2 {
+			pending.w2 = w
+			pending.msg2 = msg
+			pending.hasW2 = true
 		} else {
 			// 已有 w2，替换为最新的重试（第三次重试覆盖第二次）
-			session.pending.w2 = w
-			session.pending.msg2 = msg
+			pending.w2 = w
+			pending.msg2 = msg
 		}
 		session.mu.Unlock()
 		if s.debug {
@@ -881,6 +1001,36 @@ func (s *DNSServer) handleControl(w dns.ResponseWriter, msg *dns.Msg, q dns.Ques
 		s.sendResponse(w, msg, q, session, "OK")
 		if s.debug {
 			log.Printf("  compression = %v", meta.Param == 1)
+		}
+
+	case cmdWindow:
+		if meta.Param == 0 {
+			session.mu.Lock()
+			actual := session.window
+			session.mu.Unlock()
+			if actual < 1 {
+				actual = 1
+			}
+			s.sendResponse(w, msg, q, session, fmt.Sprintf("OK,%d", actual))
+			if s.debug {
+				log.Printf("  window probe ack (current %d)", actual)
+			}
+			return
+		}
+		requested := int(meta.Param)
+		if requested < 1 {
+			requested = 1
+		}
+		actual := requested
+		if actual > maxWindow {
+			actual = maxWindow
+		}
+		session.mu.Lock()
+		session.window = actual
+		session.mu.Unlock()
+		s.sendResponse(w, msg, q, session, fmt.Sprintf("OK,%d", actual))
+		if s.debug {
+			log.Printf("  window = %d (requested %d)", actual, requested)
 		}
 
 	case cmdRecType:
@@ -1044,27 +1194,50 @@ func (s *DNSServer) handleData(w dns.ResponseWriter, msg *dns.Msg, q dns.Questio
 	tcpData := decoded[1:]
 
 	session.mu.Lock()
-	isNew := false
-	if !session.upInited {
-		session.upRecvSeq = meta.Seq
-		session.upInited = true
-		isNew = true
-	} else if meta.Seq == nextSeq(session.upRecvSeq) {
-		session.upRecvSeq = meta.Seq
-		isNew = true
-	} else if meta.Seq == session.upRecvSeq {
-		isNew = false
-	}
-
-	var notifyStream *Stream
-	if isNew && len(tcpData) > 0 {
-		if st, ok := session.streams[streamID]; ok && !st.closed && st.conn != nil {
-			st.upBuf = append(st.upBuf, tcpData...)
-			notifyStream = st
+	var notifyStreams []*Stream
+	deliver := func(frame upFrame) {
+		if len(frame.data) == 0 {
+			return
+		}
+		if st, ok := session.streams[frame.sid]; ok && !st.closed && st.conn != nil {
+			st.upBuf = append(st.upBuf, frame.data...)
+			notifyStreams = append(notifyStreams, st)
 		}
 	}
+
+	expected := nextSeq(session.upRecvSeq)
+	frame := upFrame{sid: streamID, data: tcpData}
+	if meta.Seq == expected {
+		deliver(frame)
+		session.upRecvSeq = meta.Seq
+		for {
+			next := nextSeq(session.upRecvSeq)
+			cached, ok := session.upReorder[next]
+			if !ok {
+				break
+			}
+			delete(session.upReorder, next)
+			deliver(cached)
+			session.upRecvSeq = next
+		}
+	} else if seqInWindow(meta.Seq, expected, session.window) {
+		dataCopy := make([]byte, len(tcpData))
+		copy(dataCopy, tcpData)
+		session.upReorder[meta.Seq] = upFrame{sid: streamID, data: dataCopy}
+		if s.debug {
+			log.Printf("  upstream reorder: cached future seq=%d expected=%d ack=%d",
+				meta.Seq, expected, session.upRecvSeq)
+		}
+	} else if meta.Seq == session.upRecvSeq && s.debug {
+		log.Printf("  upstream reorder: duplicate seq=%d expected=%d ack=%d",
+			meta.Seq, expected, session.upRecvSeq)
+	} else if s.debug {
+		log.Printf("  upstream reorder: drop old/far seq=%d expected=%d ack=%d",
+			meta.Seq, expected, session.upRecvSeq)
+	}
 	session.mu.Unlock()
-	if notifyStream != nil {
+
+	for _, notifyStream := range notifyStreams {
 		select {
 		case notifyStream.upSig <- struct{}{}:
 		default:
@@ -1084,12 +1257,10 @@ func (s *DNSServer) handleData(w dns.ResponseWriter, msg *dns.Msg, q dns.Questio
 func (s *DNSServer) handlePollWithAck(w dns.ResponseWriter, msg *dns.Msg, q dns.Question, session *Session, downAck uint8) {
 	session.mu.Lock()
 	session.lastActive = time.Now()
-
-	// 推进下行 seq：client 捎带的 downAck 等于服务端当前下行 seq 表示这个 chunk 已收到。
-	if session.downChunk != nil && downAck == session.downSeq {
-		session.downChunk = nil
-		session.downAcked = true
-		session.downSeq = nextSeq(session.downSeq)
+	released := session.releaseDownAck(downAck)
+	if s.debug && len(released) > 0 {
+		log.Printf("  down ack=%d released seq=%v flights=%d/%d",
+			downAck, released, session.countDownFlights(), session.window)
 	}
 
 	// session 已关闭
@@ -1102,75 +1273,120 @@ func (s *DNSServer) handlePollWithAck(w dns.ResponseWriter, msg *dns.Msg, q dns.
 		return
 	}
 
-	// 还有未 ack 的 chunk：原样重发
-	if session.downChunk != nil && !session.downAcked {
-		chunk := session.downChunk
-		seq := session.downSeq
+	if f := session.oldestDownFlight(); f != nil && time.Since(f.sentAt) >= downRetransmitAfter {
+		flight := *f
+		f.sentAt = time.Now()
 		ack := session.upRecvSeq
-		sid := session.downChunkSID
 		compression := session.compression
+		flights := session.countDownFlights()
+		window := session.window
 		session.mu.Unlock()
-		pkt := s.buildDownPkt(chunk, seq, ack, sid, compression)
+		var pkt *DownPkt
+		if flight.streamClosed {
+			pkt = &DownPkt{Seq: flight.seq, Ack: ack, LastFrag: true, StreamID: flight.sid, StreamClosed: true}
+		} else {
+			pkt = s.buildDownPkt(flight.chunk, flight.seq, ack, flight.sid, compression)
+		}
+		if s.debug {
+			log.Printf("  down retransmit sid=%d seq=%d len=%d close=%v flights=%d/%d ack=%d",
+				flight.sid, flight.seq, len(flight.chunk), flight.streamClosed, flights, window, ack)
+		}
 		s.sendDownPkt(w, msg, q, session, pkt)
 		return
 	}
 
 	// 尝试取新数据
-	maxFrag := session.chunkLimitForQName(q.Name)
-	sid, chunk := session.getAnyDownChunk(maxFrag)
+	triedNewChunk := false
+	if session.countDownFlights() < session.window {
+		maxFrag := session.chunkLimitForQName(q.Name)
+		sid, chunk := session.getAnyDownChunk(maxFrag)
+		triedNewChunk = chunk != nil
+		if chunk != nil {
+			// 有数据：立即发送
+			flight, slot := session.addDownDataFlight(sid, chunk)
+			ack := session.upRecvSeq
+			compression := session.compression
+			flights := session.countDownFlights()
+			window := session.window
+			session.mu.Unlock()
+			if s.debug {
+				log.Printf("  down send sid=%d seq=%d len=%d slot=%d flights=%d/%d ack=%d",
+					flight.sid, flight.seq, len(flight.chunk), slot, flights, window, ack)
+			}
+			pkt := s.buildDownPkt(flight.chunk, flight.seq, ack, flight.sid, compression)
+			s.sendDownPkt(w, msg, q, session, pkt)
+			return
+		}
+	}
 
-	if chunk != nil {
-		// 有数据：立即发送
-		session.downChunk = chunk
-		session.downChunkSID = sid
-		session.downAcked = false
-		seq := session.downSeq
+	if !triedNewChunk && session.countDownFlights() < session.window {
+		closedSID := session.getClosedStreamToNotify()
+		if closedSID > 0 {
+			flight, slot := session.addDownCloseFlight(closedSID)
+			ack := session.upRecvSeq
+			flights := session.countDownFlights()
+			window := session.window
+			session.mu.Unlock()
+			if s.debug {
+				log.Printf("  down send close sid=%d seq=%d slot=%d flights=%d/%d ack=%d",
+					flight.sid, flight.seq, slot, flights, window, ack)
+			}
+			s.sendDownPkt(w, msg, q, session, &DownPkt{
+				Seq: flight.seq, Ack: ack, LastFrag: true, StreamID: flight.sid, StreamClosed: true,
+			})
+			return
+		}
+	}
+
+	// 无新数据可发时,用这个 query 重传最旧未 ack 项。累计 ack 队头阻塞时靠它推进缺口。
+	if f := session.oldestDownFlight(); f != nil {
+		flight := *f
+		f.sentAt = time.Now()
 		ack := session.upRecvSeq
 		compression := session.compression
+		flights := session.countDownFlights()
+		window := session.window
 		session.mu.Unlock()
-		pkt := s.buildDownPkt(chunk, seq, ack, sid, compression)
+		var pkt *DownPkt
+		if flight.streamClosed {
+			pkt = &DownPkt{Seq: flight.seq, Ack: ack, LastFrag: true, StreamID: flight.sid, StreamClosed: true}
+		} else {
+			pkt = s.buildDownPkt(flight.chunk, flight.seq, ack, flight.sid, compression)
+		}
+		if s.debug {
+			log.Printf("  down retransmit sid=%d seq=%d len=%d close=%v flights=%d/%d ack=%d",
+				flight.sid, flight.seq, len(flight.chunk), flight.streamClosed, flights, window, ack)
+		}
 		s.sendDownPkt(w, msg, q, session, pkt)
 		return
 	}
 
 	// 无数据
 	if !session.lazyMode {
-		// 非 lazy：检查 closed stream 通知，否则回空
-		closedSID := session.getClosedStreamToNotify()
 		ack := session.upRecvSeq
 		session.mu.Unlock()
-		if closedSID > 0 {
-			s.sendDownPkt(w, msg, q, session, &DownPkt{
-				Ack: ack, LastFrag: true, StreamID: closedSID, StreamClosed: true,
-			})
-			return
-		}
 		s.sendDownPkt(w, msg, q, session, &DownPkt{Ack: ack, LastFrag: true})
 		return
 	}
 
-	// lazy 模式：存 pending，等 TCP 数据到达或超时
-	oldPending := session.pending
-	if oldPending != nil {
-		if session.pendingTimer != nil {
-			session.pendingTimer.Stop()
-		}
+	// lazy 模式：存 pending，等 TCP 数据到达或超时。列表长度 capped 到 window。
+	var oldPending *pendingQuery
+	if len(session.pendingList) >= session.window {
+		oldPending = session.popOldestPending()
 	}
-
 	p := &pendingQuery{
 		w:          w,
 		msg:        msg,
 		q:          q,
 		qnameLower: strings.ToLower(q.Name),
 	}
-	session.pending = p
-	session.pendingTimer = time.AfterFunc(lazyTimeout, func() {
+	p.timer = time.AfterFunc(lazyTimeout, func() {
 		s.expirePending(session, p)
 	})
+	session.pendingList = append(session.pendingList, p)
 	ack := session.upRecvSeq
 	session.mu.Unlock()
 
-	// 旧 pending 回空（在锁外发送）
 	if oldPending != nil {
 		s.sendPendingResponse(session, oldPending, &DownPkt{Ack: ack, LastFrag: true})
 	}
@@ -1182,21 +1398,25 @@ func (s *DNSServer) handlePollWithAck(w dns.ResponseWriter, msg *dns.Msg, q dns.
 // 无 pending 或无数据则什么都不做，保留 pending 等下次数据或超时。
 func (s *DNSServer) fulfillPending(session *Session) {
 	session.mu.Lock()
-	p := session.pending
-	if p == nil {
+	if len(session.pendingList) == 0 {
 		session.mu.Unlock()
 		return
 	}
+	p := session.pendingList[0]
 
 	if session.closed {
-		session.pending = nil
-		if session.pendingTimer != nil {
-			session.pendingTimer.Stop()
-			session.pendingTimer = nil
+		session.removePending(p)
+		if p.timer != nil {
+			p.timer.Stop()
 		}
 		ack := session.upRecvSeq
 		session.mu.Unlock()
 		s.sendPendingResponse(session, p, &DownPkt{Ack: ack, Closed: true, LastFrag: true})
+		return
+	}
+
+	if session.countDownFlights() >= session.window {
+		session.mu.Unlock()
 		return
 	}
 
@@ -1207,15 +1427,21 @@ func (s *DNSServer) fulfillPending(session *Session) {
 		// 没有数据块，检查是否有关闭的 stream 需要通知
 		closedSID := session.getClosedStreamToNotify()
 		if closedSID > 0 {
-			session.pending = nil
-			if session.pendingTimer != nil {
-				session.pendingTimer.Stop()
-				session.pendingTimer = nil
+			session.removePending(p)
+			if p.timer != nil {
+				p.timer.Stop()
 			}
+			flight, slot := session.addDownCloseFlight(closedSID)
 			ack := session.upRecvSeq
+			flights := session.countDownFlights()
+			window := session.window
 			session.mu.Unlock()
+			if s.debug {
+				log.Printf("  down send close sid=%d seq=%d slot=%d flights=%d/%d ack=%d",
+					flight.sid, flight.seq, slot, flights, window, ack)
+			}
 			s.sendPendingResponse(session, p, &DownPkt{
-				Ack: ack, LastFrag: true, StreamID: closedSID, StreamClosed: true,
+				Seq: flight.seq, Ack: ack, LastFrag: true, StreamID: flight.sid, StreamClosed: true,
 			})
 			return
 		}
@@ -1224,21 +1450,23 @@ func (s *DNSServer) fulfillPending(session *Session) {
 		return
 	}
 
-	// 有数据：清 pending + 存 downChunk + 发送
-	session.pending = nil
-	if session.pendingTimer != nil {
-		session.pendingTimer.Stop()
-		session.pendingTimer = nil
+	// 有数据：清 pending + 存 downFlight + 发送
+	session.removePending(p)
+	if p.timer != nil {
+		p.timer.Stop()
 	}
-	session.downChunk = chunk
-	session.downChunkSID = sid
-	session.downAcked = false
-	seq := session.downSeq
+	flight, slot := session.addDownDataFlight(sid, chunk)
 	ack := session.upRecvSeq
 	compression := session.compression
+	flights := session.countDownFlights()
+	window := session.window
 	session.mu.Unlock()
 
-	pkt := s.buildDownPkt(chunk, seq, ack, sid, compression)
+	if s.debug {
+		log.Printf("  down send sid=%d seq=%d len=%d slot=%d flights=%d/%d ack=%d",
+			flight.sid, flight.seq, len(flight.chunk), slot, flights, window, ack)
+	}
+	pkt := s.buildDownPkt(flight.chunk, flight.seq, ack, flight.sid, compression)
 	s.sendPendingResponse(session, p, pkt)
 }
 
@@ -1247,13 +1475,11 @@ func (s *DNSServer) fulfillPending(session *Session) {
 // 新 poll 替换，则什么都不做。
 func (s *DNSServer) expirePending(session *Session, expected *pendingQuery) {
 	session.mu.Lock()
-	if session.pending != expected {
+	if !session.removePending(expected) {
 		// pending 已被替换或已 fulfilled
 		session.mu.Unlock()
 		return
 	}
-	session.pending = nil
-	session.pendingTimer = nil
 
 	if session.closed {
 		ack := session.upRecvSeq
@@ -1262,13 +1488,27 @@ func (s *DNSServer) expirePending(session *Session, expected *pendingQuery) {
 		return
 	}
 
-	closedSID := session.getClosedStreamToNotify()
 	ack := session.upRecvSeq
+	var flight downFlight
+	slot := -1
+	closedSID := uint8(0)
+	if session.countDownFlights() < session.window {
+		closedSID = session.getClosedStreamToNotify()
+		if closedSID > 0 {
+			flight, slot = session.addDownCloseFlight(closedSID)
+		}
+	}
+	flights := session.countDownFlights()
+	window := session.window
 	session.mu.Unlock()
 
 	if closedSID > 0 {
+		if s.debug {
+			log.Printf("  down send close sid=%d seq=%d slot=%d flights=%d/%d ack=%d",
+				flight.sid, flight.seq, slot, flights, window, ack)
+		}
 		s.sendPendingResponse(session, expected, &DownPkt{
-			Ack: ack, LastFrag: true, StreamID: closedSID, StreamClosed: true,
+			Seq: flight.seq, Ack: ack, LastFrag: true, StreamID: flight.sid, StreamClosed: true,
 		})
 		return
 	}

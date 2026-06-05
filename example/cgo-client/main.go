@@ -117,6 +117,11 @@ func StartDnsClient(listenAddr *C.char, dnsServerAddr *C.char,
 		// Start 返回错误时,defer 内部会把 running 置回 false,
 		// IsDnsClientRunning 之后会返回 0。
 		_ = client.Start()
+		clientMu.Lock()
+		if dnsClient == client {
+			dnsClient = nil
+		}
+		clientMu.Unlock()
 	}()
 	return 0
 }

@@ -119,9 +119,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create DNS client: %v", err)
 		}
+		client.SetWindow(tunnel.MaxWindow)
 		log.Printf("Starting DNS tunnel client:")
 		log.Printf("  TCP listening on: %s", *clientListen)
 		log.Printf("  Tunneling to DNS server: %s", *clientDest)
+		log.Printf("  Window: auto (max %d)", tunnel.MaxWindow)
 		log.Printf("  Encryption: enabled")
 		if *domain != "" {
 			log.Printf("  NS delegation domain: %s", *domain)

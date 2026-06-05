@@ -13,7 +13,7 @@
 //
 // 关键不变量：
 //   - 上下行 seq 各 1 字节,0..254 滚动,255 保留给控制帧标识。
-//   - 上下行各自 stop-and-wait,最多 1 个未确认 chunk 在途。
+//   - 上下行使用 session 级小窗口；单条 frame 仍由累计 ack 释放。
 //   - Frag 字段保留,本实现一帧一段、LastFrag 恒为 true。
 package tunnel
 
@@ -33,7 +33,9 @@ const (
 	// v4: 新增 cmdRespSize (0x0B) 用于"长 QNAME + 大 rdata"二维总响应预算探测，
 	//     解决"单维度都过 / 二维组合时静默丢包"的盲区。
 	// v5: NULL 记录探测数据改为随机字节 + Vigenère 加密，消除固定递增字节模式。
-	protoVersion = 5
+	// v6: 新增 cmdWindow (0x0C),提交 session 级小窗口。
+	// v7: cmdWindow Param=0 变为窗口探测；运行期允许客户端降窗重提交。
+	protoVersion = 7
 
 	// seqControl 是上行 meta 第 1 字节 == 0xFF 的"控制帧"标记。
 	// 客户端发任何控制命令时 seq 都填这个,数据帧 seq 走 0..254。
@@ -53,6 +55,7 @@ const (
 	cmdQNameProbe   = uint8(0x09) // 上行 QNAME 长度自动探测：服务端回 "OK",不解 dataStr
 	cmdContentProbe = uint8(0x0A) // 上行内容字符集探测：服务端把 dataStr 原样 echo 回去（仿 iodine 'Z' 命令）
 	cmdRespSize     = uint8(0x0B) // "长 QNAME + 大 rdata"组合下的总响应预算探测/提交（参数区分 0=probe / 1=commit）
+	cmdWindow       = uint8(0x0C) // session 窗口；Param=0 探测,Param>0 提交/降窗,响应 OK,<actual>
 
 	// DownPkt Flags 字段的位定义。
 	flagLastFrag     = uint8(0x80) // 本片是最后一片（本实现恒为 1）
@@ -61,8 +64,17 @@ const (
 	flagStreamClosed = uint8(0x10) // 某个 stream 关闭（SID 字段指明）
 
 	maxSeqNo          = 254 // 序号最大值；255 留给 seqControl
+	seqSpace          = int(maxSeqNo) + 1
+	maxWindow         = 127 // Largest safe window with 1-byte seq/ack; must stay below half the seq space.
+	defaultWindow     = 64  // Library default probe ceiling; CLI opts into maxWindow explicitly.
 	downPktHeaderSize = 5   // DownPkt 头部固定 5 字节
 )
+
+// DefaultWindow is the client-side automatic window probe ceiling.
+const DefaultWindow = defaultWindow
+
+// MaxWindow is the largest session window this implementation will negotiate.
+const MaxWindow = maxWindow
 
 // UpMeta 是上行 QNAME 的 META 段（6 hex = 3 字节）解出来的结构。
 //
@@ -318,4 +330,108 @@ func nextSeq(s uint8) uint8 {
 		s = 0
 	}
 	return s
+}
+
+// seqDistance 返回 a 相对 b 在数据 seq 环上的前向距离。
+// seq 空间只有 0..254；255 是控制帧标识,不能按 256 取模。
+func seqDistance(a, b uint8) int {
+	return (int(a) - int(b) + seqSpace) % seqSpace
+}
+
+// seqInWindow 判断 seq 是否落在从 start 开始、长度为 window 的前向窗口内。
+// start 本身算命中；window<=0 时恒 false。
+func seqInWindow(seq, start uint8, window int) bool {
+	if window <= 0 || window > seqSpace {
+		return false
+	}
+	return seqDistance(seq, start) < window
+}
+
+func ackCovers(ack, seq uint8) bool {
+	return seqDistance(ack, seq) < maxWindow
+}
+
+func windowProbeCandidates(requested int) []int {
+	if requested < 1 {
+		requested = 1
+	}
+	if requested > maxWindow {
+		requested = maxWindow
+	}
+	candidates := make([]int, 0, 8)
+	for n := requested; n >= 1; n = (n + 1) / 2 {
+		candidates = append(candidates, n)
+		if n == 1 {
+			break
+		}
+	}
+	return candidates
+}
+
+func windowProbeFallback(requested int) int {
+	if requested < 1 {
+		return 1
+	}
+	if requested > 4 {
+		return 4
+	}
+	return requested
+}
+
+func windowIncreaseAckTarget(window int) int {
+	if window < 1 {
+		window = 1
+	}
+	target := window * 4
+	if target < 16 {
+		return 16
+	}
+	return target
+}
+
+func dataQueryCredit(window int) int {
+	if window < 1 {
+		return 1
+	}
+	if window > maxWindow {
+		return maxWindow
+	}
+	return window
+}
+
+func canSendUpData(activeUpFrames, queryInFlight, window int) bool {
+	credit := dataQueryCredit(window)
+	return activeUpFrames < credit && queryInFlight < credit
+}
+
+func pollCredit(downActive, upstreamBacklog bool, window int) int {
+	if upstreamBacklog {
+		return 0
+	}
+	if !downActive {
+		return 1
+	}
+	if window < 1 {
+		return 1
+	}
+	if window > maxWindow {
+		return maxWindow
+	}
+	return window
+}
+
+func canSendPoll(pollInFlight, queryInFlight int, downActive, upstreamBacklog bool, window int) bool {
+	credit := pollCredit(downActive, upstreamBacklog, window)
+	return pollInFlight < credit && queryInFlight < credit
+}
+
+func clampPollInFlight(inFlight int, downActive, upstreamBacklog bool, window int) int {
+	if inFlight < 0 {
+		return 0
+	}
+	credit := pollCredit(downActive, upstreamBacklog, window)
+	if inFlight > credit {
+		return credit
+	}
+	return inFlight
 }

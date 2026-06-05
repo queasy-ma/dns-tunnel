@@ -105,6 +105,14 @@ const (
 	// 略大于实测值即可，保留余量比贴线探测安全（链路上的 MTU / EDNS 阈值往往有抖动）。
 	dnsRespOverhead = 50
 
+	// 单 stream 本地缓冲高水位。DNS 隧道吞吐远低于本地 TCP,不做背压时大文件
+	// 会被 reader 一口气读进内存,绕过 TCP 自然流控并放大乱序/重传窗口。
+	maxStreamBuffer = 64 * 1024
+
+	// 下行 flight 超过这个时间还没被累计 ack 覆盖时,后续 poll 优先补洞而不是继续发新 chunk。
+	// 值要大于常见公网 RTT,但小于 lazyTimeout,避免 3MB 传输时一个丢包把下行 reorder 拉长。
+	downRetransmitAfter = 750 * time.Millisecond
+
 	// DefaultKey 是 Vigenère 默认密钥。仅用于字节扰动（降低字节特征与已知协议头
 	// 的相关性）,不提供机密性保障。要真正加密请换 AEAD（AES-GCM / ChaCha20-Poly1305）+ KDF。
 	DefaultKey = "!QAZ@WSX#EDC$RFV%TGB^YHN"
