@@ -67,6 +67,7 @@ const (
 	seqSpace          = int(maxSeqNo) + 1
 	maxWindow         = 127 // Largest safe window with 1-byte seq/ack; must stay below half the seq space.
 	defaultWindow     = 64  // Library default probe ceiling; CLI opts into maxWindow explicitly.
+	maxActivePolls    = 16  // Active-down poll cap; data can use the full negotiated window.
 	downPktHeaderSize = 5   // DownPkt 头部固定 5 字节
 )
 
@@ -413,6 +414,9 @@ func pollCredit(downActive, upstreamBacklog bool, window int) int {
 	}
 	if window < 1 {
 		return 1
+	}
+	if window > maxActivePolls {
+		return maxActivePolls
 	}
 	if window > maxWindow {
 		return maxWindow

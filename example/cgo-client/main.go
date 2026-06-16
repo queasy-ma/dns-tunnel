@@ -13,6 +13,10 @@
 //	     // 优雅关闭。多次调用安全（第二次起 no-op）。
 //	int  IsDnsClientRunning(void);
 //	     // 1 = 运行中,0 = 未启动 / 已停止。
+//	char* GetDnsClientStatus(void);
+//	     // 返回 key=value 多行状态字符串；调用方用 FreeDnsTunnelString 释放。
+//	void FreeDnsTunnelString(char* s);
+//	     // 释放 GetDnsClientStatus 返回的字符串。
 //
 // 编译为静态库 (Linux / macOS):
 //
@@ -46,6 +50,7 @@ import "C"
 
 import (
 	"sync"
+	"unsafe"
 
 	"github.com/queasy-ma/dns-tunnel/tunnel"
 )
@@ -150,6 +155,28 @@ func IsDnsClientRunning() C.int {
 		return 1
 	}
 	return 0
+}
+
+// 返回当前客户端状态。返回值由 C.malloc 分配;调用方必须调用 FreeDnsTunnelString 释放。
+//
+//export GetDnsClientStatus
+func GetDnsClientStatus() *C.char {
+	clientMu.Lock()
+	c := dnsClient
+	clientMu.Unlock()
+	if c == nil {
+		return C.CString("client_present=false\nrunning=false\ntunnel_up=false\n")
+	}
+	return C.CString(c.StatusString())
+}
+
+// 释放 GetDnsClientStatus 返回的字符串。传 NULL 安全。
+//
+//export FreeDnsTunnelString
+func FreeDnsTunnelString(s *C.char) {
+	if s != nil {
+		C.free(unsafe.Pointer(s))
+	}
 }
 
 // main 必须存在但留空——c-archive / c-shared 不会执行它,只用于满足 package main。

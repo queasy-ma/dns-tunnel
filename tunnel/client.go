@@ -6,7 +6,7 @@
 // 关键组件：
 //   - DNSClient        ：客户端运行态,管理监听 socket + sessionID + stream 表。
 //   - dataLoop         ：唯一负责"发上行 + 收下行"的 goroutine；空闲 1 pending,
-//     活跃时使用 session 级小窗口。
+//     活跃时使用 session 级小窗口；active-down poll 另有较小上限。
 //   - dnsRecvLoop      ：唯一负责底层 socket 读的 goroutine,解出 DNS 响应送入 recvCh。
 //   - streamReader     ：每个 stream 一个,本地 TCP read → 入 upBuf,唤醒 dataLoop。
 //   - streamWriter     ：每个 stream 一个,从 downBuf 异步写本地 TCP,不阻塞 dataLoop。
@@ -231,6 +231,45 @@ func (c *DNSClient) IsRunning() bool {
 	c.runMu.RLock()
 	defer c.runMu.RUnlock()
 	return c.running
+}
+
+// StatusString returns a stable, human-readable snapshot of the client tunnel state.
+// It intentionally does not include the Vigenere key.
+func (c *DNSClient) StatusString() string {
+	if c == nil {
+		return "record_type=\nencoding=\nmax_up_payload=0\nmax_down_payload=0\nwindow_max=0\nstream_count=0\n"
+	}
+
+	c.mu.Lock()
+	streamCount := len(c.streams)
+	c.mu.Unlock()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "record_type=%s\n", recordTypeName(c.useNULL))
+	fmt.Fprintf(&b, "encoding=%s\n", encodingName(c.encoding))
+	fmt.Fprintf(&b, "max_up_payload=%d\n", c.upPayload)
+	fmt.Fprintf(&b, "max_down_payload=%d\n", c.maxFrag)
+	fmt.Fprintf(&b, "window_max=%d\n", c.window)
+	fmt.Fprintf(&b, "stream_count=%d\n", streamCount)
+	return b.String()
+}
+
+func encodingName(enc int) string {
+	switch enc {
+	case EncBase64:
+		return "base64url"
+	case EncBase32:
+		return "base32"
+	default:
+		return fmt.Sprintf("unknown(%d)", enc)
+	}
+}
+
+func recordTypeName(useNULL bool) string {
+	if useNULL {
+		return "NULL"
+	}
+	return "TXT"
 }
 
 // Start 是阻塞主循环：监听 TCP、setupTunnel 握手、启动 dataLoop,
@@ -583,7 +622,7 @@ func (c *DNSClient) selectUpstream() (uint8, []byte) {
 // 规约：
 //   - 与 dnsRecvLoop 共用一个 UDP socket（net.Dial("udp", server) 后只用这一条）。
 //   - Phase 2 session 小窗口：最多 c.window 个 data frame 未 ack。
-//   - 没有上行数据时，idle 只保留 1 个 poll pending；下行活跃时补到窗口上限。
+//   - 没有上行数据时，idle 只保留 1 个 poll pending；下行活跃时补到 active poll 上限。
 //   - 收到响应就尽量补窗口（不加 idle gap,见 §14 修复演进 #5）。
 //   - tunnelUp=false 就退出；外层 Accept 循环会触发重连。
 func (c *DNSClient) dataLoop() {
@@ -779,23 +818,28 @@ func (c *DNSClient) dataLoop() {
 	markDownActive := func() {
 		downActiveUntil = time.Now().Add(2 * lazyTimeout)
 	}
-	sendPoll := func() {
+	sendPoll := func() bool {
+		active := isDownActive()
+		upBacklog := hasUpstreamBacklog()
+		if !canSendPoll(pollInFlight, queryInFlight, active, upBacklog, window) {
+			return false
+		}
 		if c.debug {
 			mode := "idle"
-			if isDownActive() {
+			if active {
 				mode = "active-down"
 			}
-			upBacklog := hasUpstreamBacklog()
 			if upBacklog {
 				mode = "upstream-backlog"
 			}
 			log.Printf("send: poll (%s, no upstream data) ack=%d polls=%d/%d queries=%d",
-				mode, downAck, pollInFlight+1, pollCredit(isDownActive(), upBacklog, window), queryInFlight+1)
+				mode, downAck, pollInFlight+1, pollCredit(active, upBacklog, window), queryInFlight+1)
 		}
 		c.asyncSendPoll(conn, downAck)
 		pollInFlight++
 		queryInFlight++
 		windowSent++
+		return true
 	}
 	releaseAcked := func(ack uint8) int {
 		released := 0
@@ -882,8 +926,10 @@ func (c *DNSClient) dataLoop() {
 			}
 			pollInFlight = clampedPolls
 		}
-		for canSendPoll(pollInFlight, queryInFlight, active, upBacklog, window) {
-			sendPoll()
+		for {
+			if !sendPoll() {
+				break
+			}
 		}
 	}
 
