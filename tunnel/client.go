@@ -245,7 +245,7 @@ func (c *DNSClient) IsRunning() bool {
 // It intentionally does not include the Vigenere key.
 func (c *DNSClient) StatusString() string {
 	if c == nil {
-		return "record_type=\nencoding=\nmax_up_payload=0\nmax_down_payload=0\nwindow=0/0\npoll=0/0\nupstream=0/0\nstream_count=0\n"
+		return "record_type=\nencoding=\nmax_up_payload=0\nmax_down_payload=0\nruntime_window=0\ndns_inflight=0/0\nupstream=0/0\npoll=0/0\nstream_count=0\n"
 	}
 
 	c.mu.Lock()
@@ -257,13 +257,14 @@ func (c *DNSClient) StatusString() string {
 	fmt.Fprintf(&b, "encoding=%s\n", encodingName(c.encoding))
 	fmt.Fprintf(&b, "max_up_payload=%d\n", c.upPayload)
 	fmt.Fprintf(&b, "max_down_payload=%d\n", c.maxFrag)
-	windowMax := c.windowMax
-	if windowMax < 1 {
-		windowMax = c.window
+	runtimeWindow := c.window
+	if runtimeWindow < 1 {
+		runtimeWindow = 1
 	}
-	fmt.Fprintf(&b, "window=%d/%d\n", c.statusQueryInFlight.Load(), windowMax)
+	fmt.Fprintf(&b, "runtime_window=%d\n", runtimeWindow)
+	fmt.Fprintf(&b, "dns_inflight=%d/%d\n", c.statusQueryInFlight.Load(), runtimeWindow)
+	fmt.Fprintf(&b, "upstream=%d/%d\n", c.statusUpInFlight.Load(), runtimeWindow)
 	fmt.Fprintf(&b, "poll=%d/%d\n", c.statusPollInFlight.Load(), c.statusPollCredit.Load())
-	fmt.Fprintf(&b, "upstream=%d/%d\n", c.statusUpInFlight.Load(), windowMax)
 	fmt.Fprintf(&b, "stream_count=%d\n", streamCount)
 	return b.String()
 }
