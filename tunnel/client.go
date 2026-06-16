@@ -103,8 +103,9 @@ type DNSClient struct {
 	upPayload   int // 上行单包能塞的明文字节上限
 	qnameBudget int // probeMaxQName 探测出的 QNAME 字符总长上限,0 = 未探或失败
 	respTotal   int // probeRespTotal 探测出的总响应字节预算,0 = 未探或失败
-	window      int // session 级固定小窗口
+	window      int // session 级当前运行窗口
 	reqWindow   int // client-requested session window, clamped by the server
+	windowMax   int // handshake-negotiated window; status denominator, runtime changes do not mutate it
 
 	// 受 mu 保护：
 	mu          sync.Mutex
@@ -118,6 +119,12 @@ type DNSClient struct {
 	//   - dnsRecvLoop / processDown 致命错误 Store(false)；
 	//   - dataLoop / Accept 循环按 Load() 决定是否退出/惰性重连。
 	tunnelUp atomic.Bool
+
+	// dataLoop 发布的轻量运行态,供嵌入式 / CGO 查询状态使用。
+	statusQueryInFlight atomic.Int64
+	statusPollInFlight  atomic.Int64
+	statusPollCredit    atomic.Int64
+	statusUpInFlight    atomic.Int64
 
 	// 进程级生命周期管理。**runMu 同时保护 running / closed / quit / listener** 四个字段——
 	// 缺一不可,否则 "Close 在 Start 还没跑到时打进来" 这种竞态会让 Start 后续
@@ -171,6 +178,7 @@ func NewDNSClient(listenAddr, dnsServer string, debug bool, key string, domain s
 		upPayload:   maxUpPayload(suffix, enc),
 		window:      1,
 		reqWindow:   defaultWindow,
+		windowMax:   1,
 		streams:     make(map[uint8]*clientStream),
 		nextSID:     1,
 		upNotify:    make(chan struct{}, 1),
@@ -237,7 +245,7 @@ func (c *DNSClient) IsRunning() bool {
 // It intentionally does not include the Vigenere key.
 func (c *DNSClient) StatusString() string {
 	if c == nil {
-		return "record_type=\nencoding=\nmax_up_payload=0\nmax_down_payload=0\nwindow_max=0\nstream_count=0\n"
+		return "record_type=\nencoding=\nmax_up_payload=0\nmax_down_payload=0\nwindow=0/0\npoll=0/0\nupstream=0/0\nstream_count=0\n"
 	}
 
 	c.mu.Lock()
@@ -249,7 +257,13 @@ func (c *DNSClient) StatusString() string {
 	fmt.Fprintf(&b, "encoding=%s\n", encodingName(c.encoding))
 	fmt.Fprintf(&b, "max_up_payload=%d\n", c.upPayload)
 	fmt.Fprintf(&b, "max_down_payload=%d\n", c.maxFrag)
-	fmt.Fprintf(&b, "window_max=%d\n", c.window)
+	windowMax := c.windowMax
+	if windowMax < 1 {
+		windowMax = c.window
+	}
+	fmt.Fprintf(&b, "window=%d/%d\n", c.statusQueryInFlight.Load(), windowMax)
+	fmt.Fprintf(&b, "poll=%d/%d\n", c.statusPollInFlight.Load(), c.statusPollCredit.Load())
+	fmt.Fprintf(&b, "upstream=%d/%d\n", c.statusUpInFlight.Load(), windowMax)
 	fmt.Fprintf(&b, "stream_count=%d\n", streamCount)
 	return b.String()
 }
@@ -514,6 +528,7 @@ func (c *DNSClient) setupTunnel() error {
 	c.lazyMode = true
 	c.compression = true
 	c.window = 1
+	c.windowMax = 1
 
 	c.mu.Lock()
 	c.streams = make(map[uint8]*clientStream)
@@ -621,7 +636,7 @@ func (c *DNSClient) selectUpstream() (uint8, []byte) {
 //
 // 规约：
 //   - 与 dnsRecvLoop 共用一个 UDP socket（net.Dial("udp", server) 后只用这一条）。
-//   - Phase 2 session 小窗口：最多 c.window 个 data frame 未 ack。
+//   - Phase 2 session 小窗口：最多当前运行窗口个 data frame 未 ack。
 //   - 没有上行数据时，idle 只保留 1 个 poll pending；下行活跃时补到 active poll 上限。
 //   - 收到响应就尽量补窗口（不加 idle gap,见 §14 修复演进 #5）。
 //   - tunnelUp=false 就退出；外层 Accept 循环会触发重连。
@@ -632,9 +647,19 @@ func (c *DNSClient) dataLoop() {
 			log.Printf("DNS dial failed: %v", err)
 		}
 		c.tunnelUp.Store(false)
+		c.statusQueryInFlight.Store(0)
+		c.statusPollInFlight.Store(0)
+		c.statusPollCredit.Store(0)
+		c.statusUpInFlight.Store(0)
 		return
 	}
 	defer conn.Close()
+	defer func() {
+		c.statusQueryInFlight.Store(0)
+		c.statusPollInFlight.Store(0)
+		c.statusPollCredit.Store(0)
+		c.statusUpInFlight.Store(0)
+	}()
 
 	recvCh := make(chan dnsResponse, maxWindow*2)
 	go c.dnsRecvLoop(conn, recvCh)
@@ -655,7 +680,8 @@ func (c *DNSClient) dataLoop() {
 	if window > maxWindow {
 		window = maxWindow
 	}
-	windowCap := window
+	// 握手探测出的窗口只作为初始保守值；运行期如果持续稳定满载,允许继续增窗到协议硬上限。
+	windowCap := maxWindow
 	var upFlights [maxWindow]upFlight
 	downInited := false   // 是否已经收到过下行,用于 lastDownSeq 初始化
 	var lastDownSeq uint8 // 上次收到的下行 seq,用于去重（同 seq 重传）
@@ -736,6 +762,20 @@ func (c *DNSClient) dataLoop() {
 			}
 		}
 	}
+	isDownActive := func() bool {
+		return !downActiveUntil.IsZero() && time.Now().Before(downActiveUntil)
+	}
+	markDownActive := func() {
+		downActiveUntil = time.Now().Add(2 * lazyTimeout)
+	}
+	publishStatus := func() {
+		active := isDownActive()
+		upBacklog := hasUpstreamBacklog()
+		c.statusQueryInFlight.Store(int64(queryInFlight))
+		c.statusPollInFlight.Store(int64(pollInFlight))
+		c.statusPollCredit.Store(int64(pollCredit(active, upBacklog, window)))
+		c.statusUpInFlight.Store(int64(countUpFlights()))
+	}
 	maybeIncreaseWindow := func(released int) {
 		if released <= 0 {
 			return
@@ -794,6 +834,7 @@ func (c *DNSClient) dataLoop() {
 		upNextSeq = nextSeq(upNextSeq)
 		queryInFlight++
 		windowSent++
+		publishStatus()
 		return true
 	}
 	sendRetransmit := func() bool {
@@ -810,13 +851,8 @@ func (c *DNSClient) dataLoop() {
 		c.asyncSendStreamData(conn, f.sid, f.data, f.seq, downAck)
 		queryInFlight++
 		windowSent++
+		publishStatus()
 		return true
-	}
-	isDownActive := func() bool {
-		return !downActiveUntil.IsZero() && time.Now().Before(downActiveUntil)
-	}
-	markDownActive := func() {
-		downActiveUntil = time.Now().Add(2 * lazyTimeout)
 	}
 	sendPoll := func() bool {
 		active := isDownActive()
@@ -839,6 +875,7 @@ func (c *DNSClient) dataLoop() {
 		pollInFlight++
 		queryInFlight++
 		windowSent++
+		publishStatus()
 		return true
 	}
 	releaseAcked := func(ack uint8) int {
@@ -925,14 +962,17 @@ func (c *DNSClient) dataLoop() {
 					pollInFlight, clampedPolls, pollCredit(active, upBacklog, window))
 			}
 			pollInFlight = clampedPolls
+			publishStatus()
 		}
 		for {
 			if !sendPoll() {
 				break
 			}
 		}
+		publishStatus()
 	}
 
+	publishStatus()
 	pump()
 
 	for c.tunnelUp.Load() {
@@ -952,6 +992,7 @@ func (c *DNSClient) dataLoop() {
 			if resp.isPoll && pollInFlight > 0 {
 				pollInFlight--
 			}
+			publishStatus()
 			pkt := c.decodeResponse(resp.raw)
 			if pkt == nil {
 				if c.debug {
@@ -967,6 +1008,7 @@ func (c *DNSClient) dataLoop() {
 					markDownActive()
 				}
 				maybeIncreaseWindow(releaseAcked(pkt.Ack))
+				publishStatus()
 			}
 
 			// processDown 里如果收到 Closed 标志会把 tunnelUp 置 false。
@@ -1023,6 +1065,7 @@ func (c *DNSClient) dataLoop() {
 				}
 				queryInFlight = 0
 				pollInFlight = 0
+				publishStatus()
 				if !sendRetransmit() {
 					pump()
 				}
@@ -1638,6 +1681,7 @@ func (c *DNSClient) commitWindow(requested int) error {
 		actual = maxWindow
 	}
 	c.window = actual
+	c.windowMax = actual
 	if c.debug {
 		log.Printf("Window committed: requested=%d actual=%d", requested, actual)
 	}
