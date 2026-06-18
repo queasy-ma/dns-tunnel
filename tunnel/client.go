@@ -48,6 +48,7 @@ type upFlight struct {
 type dnsResponse struct {
 	raw    []byte
 	isPoll bool
+	rcode  int
 }
 
 const (
@@ -701,6 +702,20 @@ func (c *DNSClient) dataLoop() {
 	// 主动关闭 lazy 模式并通知服务端。
 	windowSent := 0
 	windowRecv := 0
+	disableLazy := func(reason string) {
+		if !c.lazyMode {
+			return
+		}
+		c.lazyMode = false
+		if c.debug {
+			log.Printf("lazy degradation: %s, disabling lazy mode", reason)
+		}
+		go func() {
+			meta := CtrlMeta(cmdLazy, 0)
+			fqdn := buildFQDN("L", meta, c.sessionID, c.tld)
+			c.sendDNSRetries(fqdn, 2)
+		}()
+	}
 
 	countUpFlights := func() int {
 		n := 0
@@ -994,6 +1009,16 @@ func (c *DNSClient) dataLoop() {
 				pollInFlight--
 			}
 			publishStatus()
+			if resp.rcode != dns.RcodeSuccess {
+				if c.debug {
+					log.Printf("recv: dns rcode=%d isPoll=%v, treating as lost response", resp.rcode, resp.isPoll)
+				}
+				if resp.isPoll && shouldDisableLazyForRcode(resp.rcode) {
+					disableLazy(fmt.Sprintf("poll rcode=%d", resp.rcode))
+				}
+				pump()
+				continue
+			}
 			pkt := c.decodeResponse(resp.raw)
 			if pkt == nil {
 				if c.debug {
@@ -1029,15 +1054,7 @@ func (c *DNSClient) dataLoop() {
 			// lazy 降级检测（参考 iodine）：发了 >6 个查询却收不到任何响应，
 			// 说明解析器不转发 lazy 延迟响应。关闭 lazy 让服务端立即回包。
 			if c.lazyMode && windowSent > 6 && windowRecv == 0 {
-				c.lazyMode = false
-				if c.debug {
-					log.Printf("lazy degradation: %d sent / %d recv, disabling lazy mode", windowSent, windowRecv)
-				}
-				go func() {
-					meta := CtrlMeta(cmdLazy, 0)
-					fqdn := buildFQDN("L", meta, c.sessionID, c.tld)
-					c.sendDNSRetries(fqdn, 2)
-				}()
+				disableLazy(fmt.Sprintf("%d sent / %d recv", windowSent, windowRecv))
 			}
 
 			if queryInFlight > 0 {
@@ -1192,8 +1209,8 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 //   - 短暂 ICMP 错误（ECONNREFUSED / EHOSTUNREACH / ENETUNREACH）忽略：
 //     Linux 在对端 reply socket 短暂消失时会回这些,但下一次 Exchange 通常
 //     就恢复了。让 dataLoop 的 timeout 路径自己重传即可。
-//   - FormatError / ServerFailure / Refused：服务端不再认这个 session
-//     （可能重启了、或者编码协商失败）。直接 tunnelUp=false,Start 循环会重连。
+//   - 运行期 DNS rcode 不直接拆 tunnel。递归链路可能把 lazy-held poll 转成
+//     SERVFAIL；这种响应要交给 dataLoop 触发 lazy fallback,而不是杀死接收循环。
 //   - 其它致命错误（i/o 永久错）：tunnelUp=false。
 //
 // **背压**：recvCh 容量随 maxWindow 放大,写入时给 100ms 超时；超时丢包并打日志。
@@ -1201,6 +1218,15 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 // 看似稳定但偶现死锁。
 func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- dnsResponse) {
 	buf := make([]byte, 65536)
+	sendResp := func(resp dnsResponse) {
+		select {
+		case ch <- resp:
+		case <-time.After(100 * time.Millisecond):
+			if c.debug {
+				log.Printf("recv channel backpressure, dropping packet")
+			}
+		}
+	}
 	for c.tunnelUp.Load() {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, err := conn.Read(buf)
@@ -1242,22 +1268,10 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- dnsResponse) {
 					n, msg.Id, msg.Rcode, len(msg.Answer), qname)
 			}
 			if msg.Rcode != dns.RcodeSuccess {
-				// FormErr / ServFail / Refused 意味着服务端已经不认这个
-				// session 了（重启了、或者编码协商出现不一致）。立刻拆
-				// tunnel 让 dataLoop 退出,外层重连。
-				if msg.Rcode == dns.RcodeFormatError ||
-					msg.Rcode == dns.RcodeServerFailure ||
-					msg.Rcode == dns.RcodeRefused {
-					if c.debug {
-						log.Printf("DNS recv loop: fatal rcode %d, tearing down", msg.Rcode)
-					}
-					c.tunnelUp.Store(false)
-					return
-				}
-				// 其它非 success rcode（如 NXDOMAIN）忽略,等下次响应。
 				if c.debug {
-					log.Printf("  non-success rcode %d, ignoring", msg.Rcode)
+					log.Printf("  non-success rcode %d → recvCh", msg.Rcode)
 				}
+				sendResp(dnsResponse{isPoll: responseIsPoll(qname), rcode: msg.Rcode})
 				continue
 			}
 			raw, err := c.extractAnswer(msg)
@@ -1279,16 +1293,15 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- dnsResponse) {
 			// 复制一份,避免下次 Read 复用 buf 时把数据覆盖了。
 			data := make([]byte, len(raw))
 			copy(data, raw)
-			resp := dnsResponse{raw: data, isPoll: responseIsPoll(qname)}
-			select {
-			case ch <- resp:
-			case <-time.After(100 * time.Millisecond):
-				if c.debug {
-					log.Printf("recv channel backpressure, dropping packet")
-				}
-			}
+			sendResp(dnsResponse{raw: data, isPoll: responseIsPoll(qname), rcode: msg.Rcode})
 		}
 	}
+}
+
+func shouldDisableLazyForRcode(rcode int) bool {
+	return rcode == dns.RcodeServerFailure ||
+		rcode == dns.RcodeFormatError ||
+		rcode == dns.RcodeRefused
 }
 
 func responseIsPoll(qname string) bool {
@@ -1529,6 +1542,17 @@ func (c *DNSClient) handshake() error {
 	lresp, err := c.sendDNS(lfqdn)
 	if err == nil && lresp != nil && string(lresp) == "OK" {
 		c.lazyMode = true
+		if !c.probeLazyPoll() {
+			c.lazyMode = false
+			if c.debug {
+				log.Printf("Lazy poll probe failed, disabling lazy mode")
+			}
+			dmeta := CtrlMeta(cmdLazy, 0)
+			dfqdn := buildFQDN("L", dmeta, c.sessionID, c.tld)
+			if _, err := c.sendDNSRetries(dfqdn, 2); err != nil && c.debug {
+				log.Printf("Lazy disable command failed after probe failure: %v", err)
+			}
+		}
 	} else {
 		c.lazyMode = false
 	}
@@ -1548,6 +1572,35 @@ func (c *DNSClient) handshake() error {
 	}
 
 	return nil
+}
+
+func (c *DNSClient) probeLazyPoll() bool {
+	meta := CtrlMeta(cmdPoll, 0)
+	fqdn := buildFQDN("P", meta, c.sessionID, c.tld)
+	resp, err := c.sendDNSFew(fqdn)
+	if err != nil {
+		if c.debug {
+			log.Printf("Lazy poll probe failed: %v", err)
+		}
+		return false
+	}
+	if resp == nil {
+		if c.debug {
+			log.Printf("Lazy poll probe failed: empty response")
+		}
+		return false
+	}
+	pkt := c.decodeResponse(resp)
+	if pkt == nil {
+		if c.debug {
+			log.Printf("Lazy poll probe failed: invalid down packet (%d bytes)", len(resp))
+		}
+		return false
+	}
+	if c.debug {
+		log.Printf("Lazy poll probe ok")
+	}
+	return true
 }
 
 func (c *DNSClient) probeWindow(requested int) int {
