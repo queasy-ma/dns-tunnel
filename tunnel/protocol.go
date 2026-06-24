@@ -35,7 +35,10 @@ const (
 	// v5: NULL 记录探测数据改为随机字节 + Vigenère 加密，消除固定递增字节模式。
 	// v6: 新增 cmdWindow (0x0C),提交 session 级小窗口。
 	// v7: cmdWindow Param=0 变为窗口探测；运行期允许客户端降窗重提交。
-	protoVersion = 7
+	// v8: 新增 SESSION_RESET 明文响应与 DownPkt reset flag，用于服务端重启后重建 session。
+	protoVersion = 8
+
+	sessionResetText = "SESSION_RESET"
 
 	// seqControl 是上行 meta 第 1 字节 == 0xFF 的"控制帧"标记。
 	// 客户端发任何控制命令时 seq 都填这个,数据帧 seq 走 0..254。
@@ -62,6 +65,7 @@ const (
 	flagCompressed   = uint8(0x40) // payload 走 zlib 压缩,接收端要 ZlibDecompress
 	flagClosed       = uint8(0x20) // 整个 session 关闭,client 应析构隧道
 	flagStreamClosed = uint8(0x10) // 某个 stream 关闭（SID 字段指明）
+	flagSessionReset = uint8(0x08) // 服务端丢失 session,client 必须重新握手
 
 	maxSeqNo          = 254 // 序号最大值；255 留给 seqControl
 	seqSpace          = int(maxSeqNo) + 1
@@ -150,6 +154,7 @@ type DownPkt struct {
 	Compressed   bool   // payload 被 zlib 压缩
 	Closed       bool   // 整 session 关闭
 	StreamClosed bool   // 该 stream 关闭（其它 stream 不受影响）
+	SessionReset bool   // 服务端已无此 session,client 必须换 sessionID 重握手
 	Payload      []byte // 真正的字节内容（可能空）
 }
 
@@ -172,6 +177,9 @@ func (p *DownPkt) Encode() []byte {
 	}
 	if p.StreamClosed {
 		flags |= flagStreamClosed
+	}
+	if p.SessionReset {
+		flags |= flagSessionReset
 	}
 	fb := p.Frag & 0x7F
 	if p.LastFrag {
@@ -203,6 +211,7 @@ func DecodeDownPkt(data []byte) (*DownPkt, error) {
 		Compressed:   (data[0] & flagCompressed) != 0,
 		Closed:       (data[0] & flagClosed) != 0,
 		StreamClosed: (data[0] & flagStreamClosed) != 0,
+		SessionReset: (data[0] & flagSessionReset) != 0,
 	}
 	p.Frag = data[2] & 0x7F
 	p.LastFrag = (data[2] & 0x80) != 0

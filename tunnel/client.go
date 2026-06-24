@@ -121,6 +121,12 @@ type DNSClient struct {
 	//   - dataLoop / Accept 循环按 Load() 决定是否退出/惰性重连。
 	tunnelUp atomic.Bool
 
+	sessionGeneration atomic.Int64
+
+	// setupMu 串行化重握手,避免 SESSION_RESET、Accept 惰性重连、CGO Stop
+	// 同时打进来时启动多个 dataLoop 或覆盖 sessionID。
+	setupMu sync.Mutex
+
 	// dataLoop 发布的轻量运行态,供嵌入式 / CGO 查询状态使用。
 	statusQueryInFlight atomic.Int64
 	statusPollInFlight  atomic.Int64
@@ -233,6 +239,83 @@ func (c *DNSClient) Close() {
 	if listener != nil {
 		listener.Close()
 	}
+	c.closeAllStreams()
+	c.statusQueryInFlight.Store(0)
+	c.statusPollInFlight.Store(0)
+	c.statusPollCredit.Store(0)
+	c.statusUpInFlight.Store(0)
+}
+
+func (c *DNSClient) isClosed() bool {
+	c.runMu.RLock()
+	defer c.runMu.RUnlock()
+	return c.closed
+}
+
+func (c *DNSClient) closeAllStreams() {
+	c.mu.Lock()
+	streams := make([]*clientStream, 0, len(c.streams))
+	for sid, stream := range c.streams {
+		stream.closed = true
+		stream.closing = false
+		streams = append(streams, stream)
+		delete(c.streams, sid)
+	}
+	c.nextSID = 1
+	c.lastUpSched = 0
+	c.mu.Unlock()
+
+	for _, stream := range streams {
+		if stream.conn != nil {
+			stream.conn.Close()
+		}
+		if stream.downSig != nil {
+			select {
+			case stream.downSig <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func (c *DNSClient) markTunnelReset(reason string) {
+	if c.debug {
+		log.Printf("SESSION_RESET: %s; tearing down old session %s", reason, c.sessionID)
+	}
+	c.tunnelUp.Store(false)
+	c.closeAllStreams()
+	select {
+	case c.upNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (c *DNSClient) reconnectTunnel(reason string) bool {
+	c.setupMu.Lock()
+	defer c.setupMu.Unlock()
+
+	if c.isClosed() {
+		return false
+	}
+	if c.tunnelUp.Load() {
+		return true
+	}
+	if c.debug {
+		log.Printf("Tunnel down, re-establishing (%s)...", reason)
+	}
+	if err := c.setupTunnel(); err != nil {
+		if c.debug {
+			log.Printf("Tunnel re-setup failed (%s): %v", reason, err)
+		}
+		return false
+	}
+	if c.isClosed() {
+		c.tunnelUp.Store(false)
+		c.closeAllStreams()
+		return false
+	}
+	go c.dataLoop()
+	return true
 }
 
 // IsRunning 用 RLock 允许并发查询;runMu 写者只在 MarkRunning / Close / Start 启停时短暂持有。
@@ -340,8 +423,16 @@ func (c *DNSClient) Start() error {
 		log.Printf("Listening on %s, DNS server %s, max upstream %d bytes", c.listenAddr, c.dnsServer, c.upPayload)
 	}
 
-	if err := c.setupTunnel(); err != nil {
+	c.setupMu.Lock()
+	err = c.setupTunnel()
+	c.setupMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("tunnel setup failed: %v", err)
+	}
+	if c.isClosed() {
+		c.tunnelUp.Store(false)
+		c.closeAllStreams()
+		return nil
 	}
 
 	go c.dataLoop()
@@ -371,17 +462,10 @@ func (c *DNSClient) Start() error {
 
 		// 上一次 dataLoop 退出（tunnel 死）后,这里惰性重建。
 		if !c.tunnelUp.Load() {
-			if c.debug {
-				log.Printf("Tunnel down, re-establishing...")
-			}
-			if err := c.setupTunnel(); err != nil {
-				if c.debug {
-					log.Printf("Tunnel re-setup failed: %v", err)
-				}
+			if !c.reconnectTunnel("accept") {
 				conn.Close()
 				continue
 			}
-			go c.dataLoop()
 		}
 
 		// 分配 streamID：必须用 allocStreamIDLocked 扫描空闲 slot,
@@ -452,12 +536,15 @@ func (c *DNSClient) streamWriter(stream *clientStream) {
 						stream.id, n, len(data), err)
 				}
 				c.mu.Lock()
+				alreadyClosed := stream.closed
 				stream.closed = true
 				delete(c.streams, stream.id)
 				c.mu.Unlock()
 				stream.conn.Close()
-				// 通知服务端别再发数据。后台异步发,不阻塞本 goroutine 退出。
-				go c.cmdCloseStream(stream.id)
+				if !alreadyClosed {
+					// 通知服务端别再发数据。后台异步发,不阻塞本 goroutine 退出。
+					go c.cmdCloseStream(stream.id)
+				}
 				return
 			}
 			if c.debug {
@@ -522,7 +609,10 @@ func (c *DNSClient) allocStreamIDLocked() (uint8, bool) {
 //
 // 注意：握手包走的是 c.dnsClient（同步 Exchange）,不经过 dataLoop。
 func (c *DNSClient) setupTunnel() error {
+	c.closeAllStreams()
+
 	c.sessionID = generateSessionID()
+	c.sessionGeneration.Add(1)
 	c.useNULL = false
 	c.encoding = EncBase32
 	c.upPayload = maxUpPayload(c.tld, EncBase32)
@@ -531,11 +621,6 @@ func (c *DNSClient) setupTunnel() error {
 	c.compression = true
 	c.window = 1
 	c.windowMax = 1
-
-	c.mu.Lock()
-	c.streams = make(map[uint8]*clientStream)
-	c.nextSID = 1
-	c.mu.Unlock()
 
 	if err := c.handshake(); err != nil {
 		return err
@@ -579,15 +664,22 @@ func (c *DNSClient) streamReader(stream *clientStream) {
 			}
 		}
 		if err != nil {
-			if c.debug {
-				log.Printf("stream %d: TCP read error/EOF: %v (sending cmdCloseStream)", stream.id, err)
-			}
 			c.mu.Lock()
+			alreadyClosed := stream.closed
 			stream.closed = true
 			delete(c.streams, stream.id)
 			c.mu.Unlock()
 			stream.conn.Close()
-			go c.cmdCloseStream(stream.id)
+			if c.debug {
+				action := "sending cmdCloseStream"
+				if alreadyClosed {
+					action = "already closed"
+				}
+				log.Printf("stream %d: TCP read error/EOF: %v (%s)", stream.id, err, action)
+			}
+			if !alreadyClosed {
+				go c.cmdCloseStream(stream.id)
+			}
 			return
 		}
 	}
@@ -655,16 +747,23 @@ func (c *DNSClient) dataLoop() {
 		c.statusUpInFlight.Store(0)
 		return
 	}
-	defer conn.Close()
+	generation := c.sessionGeneration.Load()
+	done := make(chan struct{})
+	reconnectAfterExit := false
 	defer func() {
+		close(done)
+		conn.Close()
 		c.statusQueryInFlight.Store(0)
 		c.statusPollInFlight.Store(0)
 		c.statusPollCredit.Store(0)
 		c.statusUpInFlight.Store(0)
+		if reconnectAfterExit && !c.isClosed() {
+			go c.reconnectTunnel("session reset")
+		}
 	}()
 
 	recvCh := make(chan dnsResponse, maxWindow*2)
-	go c.dnsRecvLoop(conn, recvCh)
+	go c.dnsRecvLoop(conn, recvCh, done, generation)
 	windowNotifyCh := make(chan int, 4)
 	go func() {
 		for n := range windowNotifyCh {
@@ -916,6 +1015,10 @@ func (c *DNSClient) dataLoop() {
 		return len(pkt.Payload) > 0 || (pkt.StreamClosed && pkt.StreamID > 0)
 	}
 	handleDown := func(pkt *DownPkt) bool {
+		if pkt.SessionReset {
+			deliverDown(pkt)
+			return false
+		}
 		if pkt.Closed {
 			deliverDown(pkt)
 			return false
@@ -991,7 +1094,7 @@ func (c *DNSClient) dataLoop() {
 	publishStatus()
 	pump()
 
-	for c.tunnelUp.Load() {
+	for c.tunnelUp.Load() && c.sessionGeneration.Load() == generation {
 		timeout := 5 * time.Second
 		if c.lazyMode {
 			// lazy 模式下,服务端会 hold 最多 lazyTimeout(1s),所以客户端 2s 仍未
@@ -1030,6 +1133,9 @@ func (c *DNSClient) dataLoop() {
 						pkt.Seq, pkt.Ack, pkt.StreamID, len(pkt.Payload), pktFlags(pkt),
 						pollInFlight, pollCredit(isDownActive(), hasUpstreamBacklog(), window), queryInFlight, countUpFlights(), window)
 				}
+				if pkt.SessionReset {
+					reconnectAfterExit = true
+				}
 				if handleDown(pkt) {
 					markDownActive()
 				}
@@ -1037,7 +1143,7 @@ func (c *DNSClient) dataLoop() {
 				publishStatus()
 			}
 
-			// processDown 里如果收到 Closed 标志会把 tunnelUp 置 false。
+			// processDown 里如果收到 Closed / SessionReset 会把 tunnelUp 置 false。
 			if !c.tunnelUp.Load() {
 				if c.debug {
 					log.Printf("recv: tunnelUp=false after processDown, dataLoop exiting")
@@ -1112,6 +1218,9 @@ func pktFlags(p *DownPkt) string {
 	if p.StreamClosed {
 		flags = append(flags, "SCLOSED")
 	}
+	if p.SessionReset {
+		flags = append(flags, "RESET")
+	}
 	if len(flags) == 0 {
 		return "[-]"
 	}
@@ -1129,11 +1238,17 @@ func pktFlags(p *DownPkt) string {
 //
 // **去重**：pkt.Seq == lastDownSeq 表示同 seq 重传,跳过 payload 处理（避免重复写）。
 func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, lastDownSeq *uint8) {
+	if pkt.SessionReset {
+		c.markTunnelReset("server has no current session")
+		return
+	}
+
 	if pkt.Closed {
 		if c.debug {
 			log.Printf("  Closed flag set: session ended by server, tearing down")
 		}
 		c.tunnelUp.Store(false)
+		c.closeAllStreams()
 		return
 	}
 
@@ -1216,21 +1331,32 @@ func (c *DNSClient) processDown(pkt *DownPkt, downAck *uint8, downInited *bool, 
 // **背压**：recvCh 容量随 maxWindow 放大,写入时给 100ms 超时；超时丢包并打日志。
 // 历史 bug（DESIGN.md §14 #8）：早期 `default` 直接丢,dataLoop 偶尔卡一下就静默丢响应,
 // 看似稳定但偶现死锁。
-func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- dnsResponse) {
+func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- dnsResponse, done <-chan struct{}, generation int64) {
 	buf := make([]byte, 65536)
 	sendResp := func(resp dnsResponse) {
 		select {
 		case ch <- resp:
+		case <-done:
 		case <-time.After(100 * time.Millisecond):
 			if c.debug {
 				log.Printf("recv channel backpressure, dropping packet")
 			}
 		}
 	}
-	for c.tunnelUp.Load() {
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, err := conn.Read(buf)
 		if err != nil {
+			select {
+			case <-done:
+				return
+			default:
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
@@ -1248,7 +1374,9 @@ func (c *DNSClient) dnsRecvLoop(conn net.Conn, ch chan<- dnsResponse) {
 			if c.debug {
 				log.Printf("DNS recv loop fatal: %v", err)
 			}
-			c.tunnelUp.Store(false)
+			if c.sessionGeneration.Load() == generation {
+				c.tunnelUp.Store(false)
+			}
 			return
 		}
 		if n > 0 {
@@ -1396,6 +1524,10 @@ func (c *DNSClient) cmdOpenStream(sid uint8) error {
 		return fmt.Errorf("stream open: %v", err)
 	}
 	if resp == nil || string(resp) != "OK" {
+		if isSessionResetResponse(resp) {
+			c.markTunnelReset("open stream received SESSION_RESET")
+			go c.reconnectTunnel("session reset on open stream")
+		}
 		if c.debug {
 			log.Printf("cmdOpenStream %d: server rejected: %q", sid, string(resp))
 		}
@@ -2390,6 +2522,9 @@ func (c *DNSClient) decodeResponse(raw []byte) *DownPkt {
 	if text == "CLOSED" {
 		return &DownPkt{Closed: true}
 	}
+	if text == sessionResetText {
+		return &DownPkt{SessionReset: true}
+	}
 
 	var data []byte
 	var err error
@@ -2427,4 +2562,8 @@ func (c *DNSClient) decodeResponse(raw []byte) *DownPkt {
 	}
 
 	return pkt
+}
+
+func isSessionResetResponse(resp []byte) bool {
+	return string(resp) == sessionResetText
 }

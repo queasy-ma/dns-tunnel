@@ -631,13 +631,21 @@ func (s *DNSServer) Start() error {
 }
 
 // getOrCreateSession —— 按 sessionID 查找或新建 Session。
-func (s *DNSServer) getOrCreateSession(sessionID string) (*Session, error) {
+//
+// 只有 cmdVersion 可以创建未知 session。服务端重启后,客户端还会带旧
+// sessionID 继续发送 poll/data/open stream；这些运行期请求必须返回
+// SESSION_RESET,让客户端换 sessionID 重握手,不能静默创建半初始化 session。
+func (s *DNSServer) getOrCreateSession(sessionID string, meta UpMeta) (*Session, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	session, exists := s.sessions[sessionID]
 	if exists && !session.IsClosed() {
-		return session, nil
+		return session, true, nil
+	}
+
+	if !meta.IsControl || meta.Command != cmdVersion {
+		return nil, false, nil
 	}
 
 	session = &Session{
@@ -659,7 +667,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string) (*Session, error) {
 	if s.debug {
 		log.Printf("New session %s", sessionID)
 	}
-	return session, nil
+	return session, true, nil
 }
 
 // openStream —— 给指定 streamID 建立到真实 TCP 目标的连接。
@@ -829,13 +837,17 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	session, err := s.getOrCreateSession(sessionID)
+	session, ok, err := s.getOrCreateSession(sessionID, meta)
 	if err != nil {
 		if s.debug {
 			log.Printf("  session error: %v", err)
 		}
 		msg.Rcode = dns.RcodeServerFailure
 		w.WriteMsg(msg)
+		return
+	}
+	if !ok {
+		s.sendSessionReset(w, msg, question, sessionID, meta)
 		return
 	}
 
@@ -938,6 +950,21 @@ func (s *DNSServer) sendAndCacheTXT(w dns.ResponseWriter, msg *dns.Msg, q dns.Qu
 	session.saveToDNSCache(q.Name, q.Qtype, []byte(text), false)
 	session.mu.Unlock()
 	s.sendTXT(w, msg, q, text)
+}
+
+func (s *DNSServer) sendSessionReset(w dns.ResponseWriter, msg *dns.Msg, q dns.Question, sessionID string, meta UpMeta) {
+	if s.debug {
+		kind := "data"
+		if meta.IsControl {
+			kind = fmt.Sprintf("control cmd=0x%02x", meta.Command)
+		}
+		log.Printf("  unknown session %s for %s, sending SESSION_RESET", sessionID, kind)
+	}
+	if q.Qtype == dns.TypeNULL {
+		s.sendNULL(w, msg, q, []byte(sessionResetText))
+	} else {
+		s.sendTXT(w, msg, q, sessionResetText)
+	}
 }
 
 // handleControl —— 处理控制帧（meta.Seq == 0xFF 的查询）。
